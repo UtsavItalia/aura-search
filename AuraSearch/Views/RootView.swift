@@ -131,7 +131,7 @@ struct RootView: View {
                 .transition(.move(edge: .bottom))
             }
         }
-        .animation(BrowserSession.searchAnimation, value: session.isSearchPresented)
+        .animation(Motion.present, value: session.isSearchPresented)
     }
 
     private var showingDownloads: Binding<Bool> {
@@ -195,7 +195,7 @@ private struct DownloadToastLayer: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .ignoresSafeArea()
-        .animation(.spring(response: 0.4, dampingFraction: 0.86), value: downloads.toastID)
+        .animation(Motion.standard, value: downloads.toastID)
     }
 }
 

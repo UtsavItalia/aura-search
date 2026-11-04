@@ -65,7 +65,7 @@ struct SearchPanel: View {
         .offset(y: dragOffset)
         // Private browsing turns the whole panel, keyboard included, dark.
         .environment(\.colorScheme, isPrivate ? .dark : colorScheme)
-        .animation(.easeInOut(duration: 0.25), value: isPrivate)
+        .animation(Motion.crossfade, value: isPrivate)
         .sensoryFeedback(.selection, trigger: isPrivate)
         // Focus straight away, so the keyboard rises with the panel.
         .onAppear { fieldFocused = true }
@@ -80,7 +80,7 @@ struct SearchPanel: View {
             } else if session.isSearchPresented {
                 // Brought back up on its way out: it never left the screen,
                 // so it has to take the keyboard back itself.
-                withAnimation(BrowserSession.searchAnimation) { dragOffset = 0 }
+                withAnimation(Motion.present) { dragOffset = 0 }
                 fieldFocused = true
             }
         }
@@ -118,7 +118,7 @@ struct SearchPanel: View {
                 if value.translation.height > 70 || value.predictedEndTranslation.height > 200 {
                     close()
                 } else {
-                    withAnimation(BrowserSession.searchAnimation) { dragOffset = 0 }
+                    withAnimation(Motion.present) { dragOffset = 0 }
                 }
             }
     }
@@ -204,7 +204,7 @@ struct SearchPanel: View {
     private var privateToggle: some View {
         let isPrivate = session.prefersPrivateTabs
         return Button {
-            withAnimation(.snappy) { session.prefersPrivateTabs.toggle() }
+            withAnimation(Motion.quick) { session.prefersPrivateTabs.toggle() }
         } label: {
             HStack(spacing: 5) {
                 if isPrivate {

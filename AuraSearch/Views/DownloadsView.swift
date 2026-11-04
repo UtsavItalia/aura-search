@@ -154,7 +154,7 @@ struct DownloadToast: View {
                 if value.translation.height > 16 { onDismiss() }
             }
         )
-        .animation(.snappy, value: item.status)
+        .animation(Motion.quick, value: item.status)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("Shows your downloads")
@@ -201,7 +201,7 @@ private struct ProgressRing: View {
                 .stroke(Color.primary, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
                 .rotationEffect(.degrees(-90))
         }
-        .animation(.linear(duration: 0.2), value: fraction)
+        .animation(Motion.progress, value: fraction)
     }
 }
 

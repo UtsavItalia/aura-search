@@ -35,6 +35,9 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
+        # Lets animations run at up to 120 fps on ProMotion iPhones. Without
+        # it, iOS holds every app to 60.
+        CADisableMinimumFrameDurationOnPhone: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

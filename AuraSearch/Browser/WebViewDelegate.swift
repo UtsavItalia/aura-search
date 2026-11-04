@@ -58,6 +58,11 @@ final class WebViewDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
         preferences.preferredContentMode = session.prefersDesktopSite(webView) ? .desktop : .recommended
         session.applyContentBlocking(to: webView, host: url.host())
+        // The page itself is about to change (not a new window), so it can
+        // crossfade into the next one.
+        if navigationAction.targetFrame != nil {
+            session.navigationStarting(in: webView, type: navigationAction.navigationType)
+        }
         return (.allow, preferences)
     }
 
@@ -94,8 +99,23 @@ final class WebViewDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         session?.downloadStarted(in: webView)
     }
 
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        session?.navigationCommitted(in: webView)
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         session?.pageDidFinishLoading(in: webView)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        // Cancelled means a newer navigation took over; it has its own picture.
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        session?.navigationFailed(in: webView)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        session?.navigationFailed(in: webView)
     }
 
     // iOS kills a web view's content process under memory pressure, which

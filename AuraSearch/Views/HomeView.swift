@@ -42,13 +42,19 @@ struct HomeView: View {
         ZStack(alignment: .topLeading) {
             PastelBackground(tint: tint)
 
-            if tabs.isEmpty {
-                emptyState(space: space)
-            } else {
-                TabCarousel(tabs: tabs, tint: tint, initialPosition: initialPosition(in: tabs))
-                    // A fresh deck per Space, so it starts on the right card.
-                    .id(space.id)
+            ZStack {
+                if tabs.isEmpty {
+                    emptyState(space: space)
+                        .transition(.opacity)
+                }
             }
+            .animation(Motion.fade, value: tabs.isEmpty)
+
+            // Kept with no tabs left too, so the last card swiped away
+            // still flies off the top.
+            TabCarousel(tabs: tabs, tint: tint, initialPosition: initialPosition(in: tabs))
+                // A fresh deck per Space, so it starts on the right card.
+                .id(space.id)
 
             spaceBar(space: space, tabs: tabs)
                 .padding(.top, metrics.safeTop)
@@ -83,7 +89,7 @@ struct HomeView: View {
             titleVisibility: .visible
         ) {
             Button("Close Tabs", role: .destructive) {
-                withAnimation(.snappy) { session.closeUnpinnedTabs(in: space.id) }
+                withAnimation(Motion.reflow) { session.closeUnpinnedTabs(in: space.id) }
             }
         } message: {
             Text("They'll stay in the archive, so you can restore them.")
@@ -166,7 +172,7 @@ struct HomeView: View {
         let isSelected = space.id == store.selectedSpaceID
         let count = store.tabs(in: space.id).count
         return Button {
-            withAnimation(.snappy) { store.selectSpace(space.id) }
+            withAnimation(Motion.quick) { store.selectSpace(space.id) }
         } label: {
             HStack(spacing: 6) {
                 Circle()
@@ -238,24 +244,37 @@ private struct TabCarousel: View {
     @Environment(\.screenMetrics) private var metrics
 
     /// The deck's place as a continuous value: card `i` sits at
-    /// `u = i − position`. Follows the finger, springs to resting positions.
+    /// `u = i − position` (plus any slide still left after a close).
+    /// Follows the finger, then glides to a resting position on `glide`,
+    /// a frame at a time.
     @State private var position: CGFloat
     @State private var drag = DeckDrag()
+    @State private var glide = DeckGlide()
+    /// Cards sliding over into the place of one that closed, and the clock
+    /// that moves them along.
+    @State private var reflow = DeckReflow()
+    @State private var reflowTicker = FrameTicker()
     /// Cards swiped away, still flying off the top. They're copies that
     /// ignore touches, so the next card can be swiped while they fly.
     @State private var flyingCards: [FlyingCard] = []
     @State private var closeCount = 0
 
+    /// A swiped-away card as it was the moment the finger let go.
     private struct FlyingCard: Identifiable {
         let id = UUID()
         let tab: BrowserTab
         let snapshot: UIImage?
         let blurredPreview: UIImage?
         let x: CGFloat
-        var y: CGFloat
         let scale: CGFloat
         let dim: Double
-        var opacity: Double
+        let titleOpacity: Double
+        let iconOpacity: Double
+        let headerVisibleWidth: CGFloat?
+        /// Just under the card that came after it, as the card itself was,
+        /// so letting go doesn't pop it up over its neighbor.
+        let zIndex: Double
+        var lift: CGFloat
     }
 
     private struct DeckDrag {
@@ -281,10 +300,13 @@ private struct TabCarousel: View {
         let entrance: CGFloat = transition?.direction == .toDeck ? 1 - (transition?.progress ?? 1) : 0
         let launch = DeckLayout.tabsButtonCenter(in: m)
         let launchDY = launch.y - (DeckLayout.cardTop(in: m) + size.height / 2)
+        // Where each card is in the deck: its place, less how far the deck
+        // has moved, plus however far it still has to slide after a close.
+        let places = tabs.indices.map { CGFloat($0) - position + reflow.offset(for: tabs[$0].id) }
 
         ZStack(alignment: .topLeading) {
             ForEach(Array(tabs.enumerated()), id: \.element.id) { index, tab in
-                let u = CGFloat(index) - position
+                let u = places[index]
                 if DeckLayout.isVisible(u) {
                     let isMoving = transition?.tabID == tab.id
                     let e = isMoving ? 0 : entrance
@@ -295,6 +317,13 @@ private struct TabCarousel: View {
                     // The moving card's header fades in as the page lands
                     // (or out as it leaves).
                     let headerFade = isMoving ? Double(transition?.progress ?? 1) : 1
+                    let headerWidth = headerVisibleWidth(
+                        nextCardAt: places.indices.contains(index + 1) ? places[index + 1] : nil,
+                        restX: restX,
+                        scale: restScale
+                    )
+                    let titleOpacity = DeckLayout.titleOpacity(u) * headerFade
+                    let iconOpacity = DeckLayout.iconOpacity(u) * headerFade
 
                     TabCard(
                         tab: tab,
@@ -302,12 +331,23 @@ private struct TabCarousel: View {
                         snapshot: tab.isPrivate ? nil : session.snapshots.images[tab.id],
                         blurredPreview: tab.isPrivate ? session.snapshots.cardPreviews[tab.id] : nil,
                         dim: DeckLayout.dim(u),
-                        titleOpacity: DeckLayout.titleOpacity(u) * headerFade,
-                        iconOpacity: DeckLayout.iconOpacity(u) * headerFade,
+                        titleOpacity: titleOpacity,
+                        iconOpacity: iconOpacity,
+                        headerVisibleWidth: headerWidth,
                         previewHidden: isMoving,
                         onOpen: { open(tab, at: u) },
-                        onClose: { dragOffset in fling(tab, at: u, dragOffset: dragOffset) },
-                        onTogglePin: { withAnimation(.snappy) { store.togglePin(tab.id) } }
+                        onClose: { dragOffset, velocity in
+                            fling(
+                                tab,
+                                at: u,
+                                dragOffset: dragOffset,
+                                velocity: velocity,
+                                titleOpacity: titleOpacity,
+                                iconOpacity: iconOpacity,
+                                headerWidth: headerWidth
+                            )
+                        },
+                        onTogglePin: { withAnimation(Motion.quick) { store.togglePin(tab.id) } }
                     )
                     .frame(width: size.width, height: totalHeight)
                     .scaleEffect(restScale + (launchScale - restScale) * e, anchor: anchor)
@@ -335,15 +375,18 @@ private struct TabCarousel: View {
                     snapshot: card.snapshot,
                     blurredPreview: card.blurredPreview,
                     dim: card.dim,
+                    titleOpacity: card.titleOpacity,
+                    iconOpacity: card.iconOpacity,
+                    headerVisibleWidth: card.headerVisibleWidth,
+                    lift: card.lift,
                     onOpen: {},
-                    onClose: { _ in },
+                    onClose: { _, _ in },
                     onTogglePin: {}
                 )
                 .frame(width: size.width, height: totalHeight)
                 .scaleEffect(card.scale, anchor: anchor)
-                .opacity(card.opacity)
-                .offset(x: card.x, y: card.y)
-                .zIndex(100_000)
+                .offset(x: card.x, y: cardY)
+                .zIndex(card.zIndex)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
             }
@@ -355,7 +398,7 @@ private struct TabCarousel: View {
         // Simultaneous, so a card's own swipe up/down still works; each
         // gesture acts only on the direction it locked onto.
         .simultaneousGesture(deckGesture)
-        .allowsHitTesting(transition == nil)
+        .allowsHitTesting(transition == nil && !tabs.isEmpty)
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: Text("Back to last tab")) { openMostRecent() }
         .accessibilityAdjustableAction { direction in
@@ -367,16 +410,34 @@ private struct TabCarousel: View {
             @unknown default: break
             }
         }
+        .accessibilityHidden(tabs.isEmpty)
         .sensoryFeedback(.impact(weight: .medium), trigger: closeCount)
         .onChange(of: tabs.count) { _, count in
-            // After a close, settle on the nearest place the deck can rest.
-            settle(at: DeckLayout.nearestRest(to: position, from: position, count: count, maxSteps: count))
+            // After a close, settle on the nearest place the deck can rest,
+            // carrying on at the speed it's gliding, if it is.
+            let target = DeckLayout.nearestRest(to: position, from: position, count: count, maxSteps: count)
+            settle(at: target, velocity: glide.velocity)
         }
+        .onDisappear {
+            glide.stop()
+            reflowTicker.stop()
+        }
+    }
+
+    /// How much of a card's header shows before the next card (at
+    /// `nextCardAt` in the deck, if there is one) covers it, in the card's
+    /// own unscaled points, less a little breathing room.
+    private func headerVisibleWidth(nextCardAt nextU: CGFloat?, restX: CGFloat, scale: CGFloat) -> CGFloat? {
+        guard let nextU else { return nil }
+        let nextX = DeckLayout.x(nextU) * metrics.width
+        return max((nextX - restX) / max(scale, 0.01) - 6, 0)
     }
 
     // MARK: - Opening
 
     private func open(_ tab: BrowserTab, at u: CGFloat) {
+        // The deck holds still while the card grows into its page.
+        glide.stop()
         session.open(tab.id, fromCard: DeckLayout.previewRect(u: u, in: metrics), deckPosition: position)
     }
 
@@ -385,46 +446,81 @@ private struct TabCarousel: View {
     private func openMostRecent() {
         guard let recent = tabs.max(by: { $0.lastActiveAt < $1.lastActiveAt }),
               let index = tabs.firstIndex(where: { $0.id == recent.id }) else { return }
-        open(recent, at: CGFloat(index) - position)
+        open(recent, at: CGFloat(index) - position + reflow.offset(for: recent.id))
     }
 
     // MARK: - Closing
 
-    /// Closes the tab the moment the swipe commits, so the next card slides
-    /// into place straight away and can be swiped at once, while a copy of
-    /// this one carries on flying up from where the finger let go.
-    private func fling(_ tab: BrowserTab, at u: CGFloat, dragOffset: CGFloat) {
+    /// Like swiping an app away: the card carries on up and off the screen
+    /// at the speed the finger let go with, solid all the way, while the
+    /// cards after it slide over to close the gap underneath.
+    ///
+    /// The tab closes the moment the swipe commits, so the next card can be
+    /// swiped at once; what flies away is a copy, drawn exactly as the card
+    /// was when the finger let go.
+    private func fling(
+        _ tab: BrowserTab,
+        at u: CGFloat,
+        dragOffset: CGFloat,
+        velocity: CGFloat,
+        titleOpacity: Double,
+        iconOpacity: Double,
+        headerWidth: CGFloat?
+    ) {
         let m = metrics
         let size = DeckLayout.cardSize(in: m)
         let totalHeight = size.height + DeckLayout.headerHeight + DeckLayout.headerSpacing
+        let cardY = DeckLayout.cardTop(in: m) - DeckLayout.headerHeight - DeckLayout.headerSpacing
+        let index = tabs.firstIndex(where: { $0.id == tab.id }) ?? tabs.count
         let card = FlyingCard(
             tab: tab,
             // Taken before closing, which drops the tab's snapshots.
             snapshot: tab.isPrivate ? nil : session.snapshots.images[tab.id],
             blurredPreview: tab.isPrivate ? session.snapshots.cardPreviews[tab.id] : nil,
             x: DeckLayout.x(u) * m.width,
-            y: DeckLayout.cardTop(in: m) - DeckLayout.headerHeight - DeckLayout.headerSpacing + dragOffset,
             scale: DeckLayout.scale(u),
             dim: DeckLayout.dim(u),
-            opacity: 1 - min(Double(max(-dragOffset, 0)) / 600, 0.5)
+            titleOpacity: titleOpacity,
+            iconOpacity: iconOpacity,
+            headerVisibleWidth: headerWidth,
+            // The cards after it take its place (and number) as it closes.
+            zIndex: Double(index) - 0.5,
+            lift: dragOffset
         )
         flyingCards.append(card)
         closeCount += 1
-        withAnimation(.snappy(duration: 0.28)) {
+        remove(tab) {
             session.closeTab(tab.id)
         }
+
+        // Clear of the top of the screen, shadow and all.
+        let target = -(cardY + totalHeight + 80)
+        let speed = Motion.relativeVelocity(velocity, toCover: target - dragOffset)
         let id = card.id
         // Next frame, once the copy is drawn where the card was.
         Task {
-            withAnimation(.easeIn(duration: 0.22)) {
+            withAnimation(Motion.fling(velocity: speed)) {
                 if let index = flyingCards.firstIndex(where: { $0.id == id }) {
-                    flyingCards[index].y = -(totalHeight + 160)
-                    flyingCards[index].opacity = 0
+                    flyingCards[index].lift = target
                 }
             } completion: {
                 flyingCards.removeAll { $0.id == id }
             }
         }
+    }
+
+    /// Takes `tab` out of the deck (`removal` does that) while the cards
+    /// after it slide over into its place, a frame at a time. Not animated
+    /// by SwiftUI: each card starts out exactly where it is, so nothing
+    /// moves until the slide does.
+    private func remove(_ tab: BrowserTab, by removal: () -> Void) {
+        if let index = tabs.firstIndex(where: { $0.id == tab.id }) {
+            reflow.remove(at: index, of: tabs.map(\.id), now: CACurrentMediaTime())
+            if reflow.isMoving {
+                reflowTicker.run { time in reflow.advance(to: time) }
+            }
+        }
+        removal()
     }
 
     // MARK: - Dragging
@@ -442,7 +538,12 @@ private struct TabCarousel: View {
                     drag = DeckDrag(start: value.startLocation, startPosition: position, isHorizontal: nil)
                 }
                 if drag.isHorizontal == nil {
-                    drag.isHorizontal = abs(value.translation.width) > abs(value.translation.height)
+                    let isHorizontal = abs(value.translation.width) > abs(value.translation.height)
+                    drag.isHorizontal = isHorizontal
+                    // A sideways drag catches the deck wherever it is, even
+                    // mid-glide. A card being swiped up or down leaves the
+                    // glide to finish, so the deck still comes to rest.
+                    if isHorizontal { glide.stop() }
                 }
                 guard drag.isHorizontal == true else { return }
                 position = rubberBanded(drag.startPosition - value.translation.width / dragStep)
@@ -452,7 +553,10 @@ private struct TabCarousel: View {
                 guard drag.isHorizontal == true else { return }
                 // Where a flick would carry the deck, at most two cards away.
                 let projected = drag.startPosition - value.predictedEndTranslation.width / dragStep
-                settle(at: DeckLayout.nearestRest(to: projected, from: drag.startPosition, count: tabs.count))
+                let target = DeckLayout.nearestRest(to: projected, from: drag.startPosition, count: tabs.count)
+                // The finger's speed in cards per second, so the glide
+                // carries straight on from the flick.
+                settle(at: target, velocity: -value.velocity.width / dragStep)
             }
     }
 
@@ -466,23 +570,24 @@ private struct TabCarousel: View {
         return value
     }
 
-    private func settle(at target: CGFloat) {
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-            position = target
+    /// Glides the deck to `target`, starting at `velocity` cards per second.
+    private func settle(at target: CGFloat, velocity: CGFloat = 0) {
+        glide.start(from: position, velocity: velocity, to: target) { value in
+            position = value
         }
     }
 
     @ViewBuilder
     private func menu(for tab: BrowserTab) -> some View {
         Button(tab.isPinned ? "Unpin" : "Pin", systemImage: tab.isPinned ? "pin.slash" : "pin") {
-            withAnimation(.snappy) { store.togglePin(tab.id) }
+            withAnimation(Motion.quick) { store.togglePin(tab.id) }
         }
         let otherSpaces = store.spaces.filter { $0.id != tab.spaceID }
         if !otherSpaces.isEmpty {
             Menu {
                 ForEach(otherSpaces) { space in
                     Button(space.name) {
-                        withAnimation(.snappy) { store.moveTab(tab.id, to: space.id) }
+                        remove(tab) { store.moveTab(tab.id, to: space.id) }
                     }
                 }
             } label: {
@@ -491,7 +596,146 @@ private struct TabCarousel: View {
         }
         Divider()
         Button("Close Tab", systemImage: "xmark", role: .destructive) {
-            withAnimation(.snappy) { session.closeTab(tab.id) }
+            remove(tab) { session.closeTab(tab.id) }
+        }
+    }
+}
+
+/// The deck gliding to rest after a flick, worked out frame by frame.
+///
+/// SwiftUI's own animations jump the stored value to the end at once, so a
+/// finger landing mid-glide would grab the deck where it was going rather
+/// than where it is. Here the value is always what's on screen: touch the
+/// deck while it glides and it stops right there, like a scroll view.
+@MainActor
+private final class DeckGlide {
+    private let ticker = FrameTicker()
+    /// How fast the deck is gliding (cards per second); 0 at rest.
+    private(set) var velocity: CGFloat = 0
+
+    /// Glides from `value` to `target`, setting off at `velocity` (cards
+    /// per second), and calls `onUpdate` with the value for every frame.
+    func start(from value: CGFloat, velocity: CGFloat, to target: CGFloat, onUpdate: @escaping (CGFloat) -> Void) {
+        stop()
+        let offset = value - target
+        let velocity = velocity.isFinite ? min(max(velocity, -40), 40) : 0
+        guard !Motion.FrameSpring.isSettled(offset: offset, velocity: velocity) else {
+            onUpdate(target)
+            return
+        }
+        let spring = Motion.FrameSpring.glide
+        let startTime = CACurrentMediaTime()
+        self.velocity = velocity
+        ticker.run { [weak self] time in
+            // Where the spring is at the moment this frame reaches the screen.
+            let now = spring.state(offset: offset, velocity: velocity, after: CGFloat(time - startTime))
+            if Motion.FrameSpring.isSettled(offset: now.offset, velocity: now.velocity) {
+                self?.velocity = 0
+                onUpdate(target)
+                return false
+            }
+            self?.velocity = now.velocity
+            onUpdate(target + now.offset)
+            return true
+        }
+    }
+
+    func stop() {
+        ticker.stop()
+        velocity = 0
+    }
+}
+
+/// Cards sliding over into the place a closed card left, worked out frame
+/// by frame like the glide. Each card starts out where it was and slides to
+/// its new place, so one caught mid-slide (swiped away straight after the
+/// card before it) is exactly where it looks, not where it's headed.
+private struct DeckReflow {
+    /// How far a card is from its place, in places (positive is to the
+    /// right), and how fast it's moving, as of `start`.
+    private struct Slide {
+        var offset: CGFloat
+        var velocity: CGFloat
+        var start: CFTimeInterval
+
+        func state(at time: CFTimeInterval) -> (offset: CGFloat, velocity: CGFloat) {
+            Motion.FrameSpring.reflow.state(offset: offset, velocity: velocity, after: CGFloat(time - start))
+        }
+    }
+
+    private var slides: [UUID: Slide] = [:]
+    /// The moment being drawn.
+    private var now: CFTimeInterval = 0
+
+    var isMoving: Bool { !slides.isEmpty }
+
+    /// How many places right of its own the card for `id` is drawn.
+    func offset(for id: UUID) -> CGFloat {
+        slides[id]?.state(at: now).offset ?? 0
+    }
+
+    /// The card at `index` in `ids` is leaving: every card after it moves
+    /// up a place, setting off from where it is now (mid-slide, even).
+    mutating func remove(at index: Int, of ids: [UUID], now time: CFTimeInterval) {
+        guard ids.indices.contains(index) else { return }
+        // While cards are moving, `now` is the frame on its way to the
+        // screen, a moment ahead; start from that, so nothing skips.
+        let start = max(now, time)
+        slides[ids[index]] = nil
+        for id in ids[(index + 1)...] {
+            let current = slides[id]?.state(at: start) ?? (offset: 0, velocity: 0)
+            slides[id] = Slide(offset: current.offset + 1, velocity: current.velocity, start: start)
+        }
+        now = start
+    }
+
+    /// Moves the clock on to `time`. False once every card is in place.
+    mutating func advance(to time: CFTimeInterval) -> Bool {
+        now = time
+        slides = slides.filter { _, slide in
+            let current = slide.state(at: time)
+            return !Motion.FrameSpring.isSettled(offset: current.offset, velocity: current.velocity)
+        }
+        return isMoving
+    }
+}
+
+/// Calls back on every frame the display draws, on its own clock (up to
+/// 120 times a second on ProMotion iPhones), until the callback is done.
+@MainActor
+private final class FrameTicker: NSObject {
+    private var link: CADisplayLink?
+    private var onFrame: ((CFTimeInterval) -> Bool)?
+    /// Counts calls to `run`, so a callback that finishes doesn't stop the
+    /// one that replaced it.
+    private var generation = 0
+
+    /// Calls `onFrame` with the moment each frame will reach the screen,
+    /// for as long as it returns true. Replaces any callback running now.
+    func run(_ onFrame: @escaping (CFTimeInterval) -> Bool) {
+        generation += 1
+        self.onFrame = onFrame
+        guard link == nil else { return }
+        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        onFrame = nil
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        guard let onFrame else {
+            stop()
+            return
+        }
+        let current = generation
+        if !onFrame(link.targetTimestamp), generation == current {
+            stop()
         }
     }
 }

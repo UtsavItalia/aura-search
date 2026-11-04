@@ -16,23 +16,33 @@ struct TabCard: View {
     var dim: Double = 0
     var titleOpacity: Double = 1
     var iconOpacity: Double = 1
+    /// How much of the header shows before the next card covers it, in the
+    /// card's own points. The title fades out there instead of running
+    /// under the next card's icon. `nil` for the last card.
+    var headerVisibleWidth: CGFloat?
     /// Hidden while the live page is moving into (or out of) this card,
     /// since the page itself is drawn there.
     var previewHidden = false
+    /// How far above its place the card is, for the copy that flies away
+    /// when the card is swiped up. Real cards only move with a finger.
+    var lift: CGFloat = 0
     let onOpen: () -> Void
     /// Called the moment a swipe up commits, with how far up the card was
-    /// dragged, so the deck can send it flying from exactly there.
-    let onClose: (_ dragOffset: CGFloat) -> Void
+    /// dragged and how fast it was going (points per second, negative is
+    /// up), so the deck can send it flying from there at that speed.
+    let onClose: (_ dragOffset: CGFloat, _ velocity: CGFloat) -> Void
     let onTogglePin: () -> Void
 
     /// Live drag, locked to one axis once it starts. Springs back on release.
-    @GestureState(resetTransaction: Transaction(animation: .spring(response: 0.35, dampingFraction: 0.8)))
+    @GestureState(resetTransaction: Transaction(animation: Motion.standard))
     private var drag = CardDrag()
     @State private var pinFeedback = 0
 
     /// How far up a card must go to close, and how far down to pin.
     private static let closeDistance: CGFloat = 130
     private static let pinDistance: CGFloat = 90
+    /// The width of the fade at the end of a title the next card covers.
+    private static let titleFade: CGFloat = 22
     /// Private cards are frosted, as in Arc: just the page's colors under a
     /// dark veil, with a faint sheen and a hairline edge, so a glance at your
     /// phone doesn't show what's in a private tab.
@@ -53,7 +63,6 @@ struct TabCard: View {
         .overlay(alignment: .top) { pinHint }
         .offset(y: offsetY)
         .scaleEffect(cardScale)
-        .opacity(cardOpacity)
         .contentShape(Rectangle())
         .onTapGesture { onOpen() }
         .simultaneousGesture(dragGesture)
@@ -61,12 +70,11 @@ struct TabCard: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("Swipe up to close, pull down to pin")
-        .accessibilityAction(named: Text("Close tab")) { onClose(0) }
+        .accessibilityAction(named: Text("Close tab")) { onClose(0, 0) }
         .accessibilityAction(named: Text(tab.isPinned ? "Unpin tab" : "Pin tab")) { onTogglePin() }
     }
 
     // MARK: - Parts
-
 
     /// Like Arc's: the site icon on a small white disc and the title in
     /// small type, sitting just above the card and in from its edge.
@@ -100,6 +108,24 @@ struct TabCard: View {
         .frame(height: DeckLayout.headerHeight, alignment: .bottom)
         .padding(.leading, 17.5)
         .padding(.trailing, 8)
+        // Masked rather than narrowed: the text keeps its layout while the
+        // deck moves, so nothing is measured again on every frame.
+        .mask(alignment: .leading) { headerMask }
+    }
+
+    @ViewBuilder
+    private var headerMask: some View {
+        if let width = headerVisibleWidth {
+            HStack(spacing: 0) {
+                Rectangle()
+                    .frame(width: max(width - Self.titleFade, 0))
+                LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: Self.titleFade)
+                Spacer(minLength: 0)
+            }
+        } else {
+            Rectangle()
+        }
     }
 
     private var previewCard: some View {
@@ -111,8 +137,6 @@ struct TabCard: View {
                 pagePreview
             }
         }
-        // Cards stacked behind the front one darken, as in Arc.
-        .overlay { Color.black.opacity(dim) }
         .clipShape(shape)
         .overlay(
             shape.strokeBorder(
@@ -121,7 +145,20 @@ struct TabCard: View {
             )
         )
         // A soft shadow on the leading edge, since cards stack left to right.
-        .shadow(color: .black.opacity(0.18), radius: 16, x: -6, y: 6)
+        // Cast by a plain shape behind the card, which never changes, so it
+        // isn't drawn again on every frame while the deck moves.
+        .background(
+            shape
+                .fill(Color(.secondarySystemBackground))
+                .shadow(color: .black.opacity(0.18), radius: 16, x: -6, y: 6)
+        )
+        // Cards stacked behind the front one darken, as in Arc. On top of
+        // everything else, so changing it doesn't touch the shadow, and
+        // always there, so the deck's layers stay the same while it moves.
+        .overlay {
+            shape.fill(Color.black.opacity(dim))
+                .allowsHitTesting(false)
+        }
     }
 
     /// The page as you left it, top aligned like a screenshot.
@@ -129,9 +166,11 @@ struct TabCard: View {
         Color(.secondarySystemBackground)
             .overlay(alignment: .top) {
                 if let snapshot {
+                    // Width-fitted from the top. Pages run the card's full
+                    // height; before iOS 26 they stop at the bar, a bit short.
                     Image(uiImage: snapshot)
                         .resizable()
-                        .scaledToFill()
+                        .scaledToFit()
                 } else {
                     FaviconView(tab: tab, tint: tint)
                         .scaleEffect(1.8)
@@ -192,17 +231,20 @@ struct TabCard: View {
     // MARK: - Drag
 
     private var offsetY: CGFloat {
-        guard drag.axis == .vertical else { return 0 }
-        // Up follows the finger; down resists, since it's a pull, not a move.
-        return drag.dy < 0 ? drag.dy : min(drag.dy * 0.45, 70)
+        let dragged: CGFloat
+        if drag.axis == .vertical {
+            // Up follows the finger; down resists, since it's a pull, not a move.
+            dragged = drag.dy < 0 ? drag.dy : min(drag.dy * 0.45, 70)
+        } else {
+            dragged = 0
+        }
+        return dragged + lift
     }
 
+    /// Shrinks a little as it goes up, like an app swiped away. It stays
+    /// solid: a card that fades shows through the cards sliding in under it.
     private var cardScale: CGFloat {
         1 - min(max(-offsetY, 0) / 2500, 0.08)
-    }
-
-    private var cardOpacity: Double {
-        1 - min(Double(max(-offsetY, 0)) / 600, 0.5)
     }
 
     private var dragGesture: some Gesture {
@@ -221,7 +263,7 @@ struct TabCard: View {
                 guard abs(dy) > abs(value.translation.width) else { return }
                 let flungUp = value.predictedEndTranslation.height < -Self.closeDistance * 2.5
                 if dy < -Self.closeDistance || (dy < -30 && flungUp) {
-                    onClose(dy)
+                    onClose(dy, value.velocity.height)
                 } else if dy > Self.pinDistance {
                     pinFeedback += 1
                     onTogglePin()

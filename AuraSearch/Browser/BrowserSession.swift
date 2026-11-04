@@ -36,6 +36,13 @@ final class BrowserSession {
     var prefersPrivateTabs = false
     /// The tab whose summary sheet is up, if any.
     var summaryTabID: UUID?
+    /// A new page arriving, from a search or a link that opens a tab: it
+    /// grows into place instead of appearing all at once.
+    private(set) var arrival: Arrival?
+    /// A picture of the page a link is leaving, held over the web view until
+    /// the next page has drawn and then faded out, so pages crossfade
+    /// instead of blinking from one to the next.
+    private(set) var pageCovers: [UUID: UIImage] = [:]
 
     let store: TabStore
     /// Page previews for the home screen's tab cards.
@@ -60,6 +67,18 @@ final class BrowserSession {
     /// Pinch to summarize, one per live web view. Gesture recognizers don't
     /// keep their targets alive, so they're kept here.
     @ObservationIgnored private var pinchHandlers: [UUID: PinchToSummarize] = [:]
+    /// Tells the session when a page has drawn. Shared by every web view; it
+    /// holds the session weakly, since content controllers keep their
+    /// handlers alive.
+    private let readyHandler: PageReadyHandler
+    /// Pictures of pages being left, taken when a link is tapped, waiting
+    /// for the next page to commit.
+    @ObservationIgnored private var leavingPictures: [UUID: UIImage] = [:]
+    @ObservationIgnored private var pictureTasks: [UUID: Task<Void, Never>] = [:]
+    /// Tabs whose cover is up: they count as drawn only once the page says
+    /// so (or a moment passes), not on load progress alone.
+    @ObservationIgnored private var coveredTabs: Set<UUID> = []
+    @ObservationIgnored private var coverTimeouts: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var hasHandledLaunch = false
     /// The tab each new tab was opened from, for going back to it if the
     /// new tab turns out to be only a download.
@@ -82,7 +101,9 @@ final class BrowserSession {
         self.downloads = DownloadManager()
         self.contentBlocker = ContentBlocker()
         self.delegate = WebViewDelegate()
+        self.readyHandler = PageReadyHandler()
         delegate.session = self
+        readyHandler.session = self
     }
 
     /// Call once at launch.
@@ -110,6 +131,11 @@ final class BrowserSession {
         } else {
             configuration.websiteDataStore = .default()
         }
+
+        // Lets the page say when it has drawn, from a script world the
+        // page's own scripts can't see.
+        configuration.userContentController.addUserScript(PageReadyHandler.script)
+        configuration.userContentController.add(readyHandler, contentWorld: .defaultClient, name: PageReadyHandler.name)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
@@ -169,7 +195,12 @@ final class BrowserSession {
     private func discardWebView(_ id: UUID, deferringObservedChanges: Bool = false) {
         observations[id] = nil // invalidates the KVO observations
         pinchHandlers[id] = nil
+        clearCover(for: id)
         if let webView = webViews.removeValue(forKey: id) {
+            webView.configuration.userContentController.removeScriptMessageHandler(
+                forName: PageReadyHandler.name,
+                contentWorld: .defaultClient
+            )
             webView.stopLoading()
             webView.navigationDelegate = nil
             webView.uiDelegate = nil
@@ -180,9 +211,11 @@ final class BrowserSession {
             Task { @MainActor [weak self] in
                 guard let self, self.webViews[id] == nil else { return }
                 self.paintedTabs.remove(id)
+                if self.pageCovers[id] != nil { self.pageCovers[id] = nil }
             }
         } else {
             paintedTabs.remove(id)
+            if pageCovers[id] != nil { pageCovers[id] = nil }
         }
     }
 
@@ -234,7 +267,10 @@ final class BrowserSession {
     }
 
     private func navigationStateChanged(_ tabID: UUID) {
-        if !paintedTabs.contains(tabID), let webView = webViews[tabID] {
+        // A covered page waits for its own "drawn" signal: load progress can
+        // run ahead of what's on screen, and lifting the cover early would
+        // show the old page again before the new one blinks in.
+        if !paintedTabs.contains(tabID), !coveredTabs.contains(tabID), let webView = webViews[tabID] {
             // Most of the page is in by 80%; a finished or failed load counts too.
             let progress = webView.estimatedProgress
             if progress >= 0.8 || (!webView.isLoading && progress > 0) {
@@ -270,19 +306,15 @@ final class BrowserSession {
         let previous = store.activeTabID
         let tab = store.openTab(url: url, isPrivate: isPrivate)
         if let previous { openers[tab.id] = previous }
+        beginArrival(of: tab.id)
         refreshNavigationState()
     }
-
-    /// How the search panel comes up, and comes back if reopened on its way out.
-    static let searchAnimation = Animation.spring(response: 0.36, dampingFraction: 0.9)
-    /// How it leaves: about as long as the keyboard takes, with no bounce.
-    static let searchCloseAnimation = Animation.spring(duration: 0.3, bounce: 0)
 
     /// Shows the search panel, for "+" and at launch.
     func presentSearch() {
         searchGeneration += 1
         if isSearchClosing {
-            withAnimation(Self.searchAnimation) { isSearchClosing = false }
+            withAnimation(Motion.present) { isSearchClosing = false }
         }
         isSearchPresented = true
     }
@@ -311,6 +343,7 @@ final class BrowserSession {
         let opener = store.tabs.first { $0.id == openerID }
         let tab = store.openTab(url: url, in: opener?.spaceID, isPrivate: opener?.isPrivate ?? false)
         if let opener { openers[tab.id] = opener.id }
+        beginArrival(of: tab.id)
         refreshNavigationState()
     }
 
@@ -373,9 +406,6 @@ final class BrowserSession {
         let deckPosition: CGFloat
     }
 
-    /// Quick with a soft landing, like the iOS app switcher.
-    static let transitionAnimation = Animation.spring(duration: 0.36, bounce: 0.1)
-
     /// Back to the tab screen: the live page shrinks into its card while
     /// the other cards fly out of the tabs button, as in Arc.
     func showHome() {
@@ -413,7 +443,7 @@ final class BrowserSession {
         )
         // Next frame, once the tab screen is drawn under the page.
         Task {
-            withAnimation(Self.transitionAnimation) {
+            withAnimation(Motion.zoom) {
                 transition?.progress = 1
             } completion: { [weak self] in
                 Task { @MainActor [weak self] in
@@ -454,7 +484,7 @@ final class BrowserSession {
         store.activate(id)
         refreshNavigationState()
         Task {
-            withAnimation(Self.transitionAnimation) {
+            withAnimation(Motion.zoom) {
                 transition?.progress = 0
             } completion: { [weak self] in
                 if self?.transition?.tabID == id { self?.transition = nil }
@@ -471,7 +501,7 @@ final class BrowserSession {
         _ = UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         searchGeneration += 1
         let generation = searchGeneration
-        withAnimation(Self.searchCloseAnimation) {
+        withAnimation(Motion.dismiss) {
             isSearchClosing = true
         } completion: { [weak self] in
             guard let self, self.searchGeneration == generation else { return }
@@ -489,7 +519,7 @@ final class BrowserSession {
     /// and records the visit (never for private tabs).
     func pageDidFinishLoading(in webView: WKWebView) {
         if let id = tabID(for: webView) {
-            paintedTabs.insert(id)
+            pageDidPaint(id)
             if !isPrivateTab(id), let url = webView.url {
                 history.recordVisit(url: url, title: webView.title)
             }
@@ -500,6 +530,128 @@ final class BrowserSession {
 
     private func isPrivateTab(_ id: UUID) -> Bool {
         store.tabs.first { $0.id == id }?.isPrivate ?? false
+    }
+
+    // MARK: - Pages arriving and changing
+
+    /// A new page arriving. 0 as it starts, 1 once it's in place.
+    struct Arrival: Equatable {
+        let tabID: UUID
+        var progress: CGFloat
+    }
+
+    /// Grows a tab that just opened into place, starting in the same update
+    /// that puts it on screen, so its first frame is already the start.
+    private func beginArrival(of id: UUID) {
+        guard metrics.isValid else { return }
+        arrival = Arrival(tabID: id, progress: 0)
+        // Next frame, once the page is drawn at its starting point.
+        Task {
+            withAnimation(Motion.arrive) {
+                arrival?.progress = 1
+            } completion: { [weak self] in
+                if self?.arrival?.tabID == id { self?.arrival = nil }
+            }
+        }
+    }
+
+    /// A link was tapped (or a form sent) in the page on screen: takes a
+    /// picture of the page now, to hold over the next one until it draws.
+    /// Back and forward swipes keep WebKit's own animation, and reloads
+    /// aren't changes of page.
+    func navigationStarting(in webView: WKWebView, type: WKNavigationType) {
+        guard type == .linkActivated || type == .formSubmitted || type == .other,
+              let id = tabID(for: webView),
+              id == store.activeTabID,
+              transition == nil,
+              webView.url != nil else { return }
+        // A newer tap (or a redirect asking again) takes a fresh picture.
+        pictureTasks[id]?.cancel()
+        leavingPictures[id] = nil
+        pictureTasks[id] = Task { [weak self, snapshots = self.snapshots] in
+            let picture = await snapshots.captureImage(of: webView)
+            guard let self, !Task.isCancelled else { return }
+            guard let picture else {
+                self.pictureTasks[id] = nil
+                return
+            }
+            self.leavingPictures[id] = picture
+            // A link to a spot on the same page never commits a new one:
+            // don't keep a whole-screen picture around for it.
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            if self.leavingPictures[id] === picture { self.leavingPictures[id] = nil }
+            self.pictureTasks[id] = nil
+        }
+    }
+
+    /// The next page has replaced the old one in WebKit, which keeps showing
+    /// the old one until the new one first draws. The picture goes up now,
+    /// without a fade, so the swap underneath can't be seen.
+    func navigationCommitted(in webView: WKWebView) {
+        guard let id = tabID(for: webView) else { return }
+        pictureTasks[id]?.cancel()
+        pictureTasks[id] = nil
+        guard let picture = leavingPictures.removeValue(forKey: id),
+              id == store.activeTabID,
+              transition == nil else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            pageCovers[id] = picture
+            coveredTabs.insert(id)
+            paintedTabs.remove(id)
+        }
+        // Never holds the old page up long, even if the new one is slow to
+        // say it has drawn.
+        coverTimeouts[id]?.cancel()
+        coverTimeouts[id] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled else { return }
+            self?.pageDidPaint(id)
+        }
+    }
+
+    /// The navigation didn't happen (an error, or a download instead): no
+    /// crossfade, and nothing left covering the page.
+    func navigationFailed(in webView: WKWebView) {
+        guard let id = tabID(for: webView) else { return }
+        pictureTasks[id]?.cancel()
+        pictureTasks[id] = nil
+        leavingPictures[id] = nil
+        if coveredTabs.contains(id) { pageDidPaint(id) }
+    }
+
+    /// The page's script reported that it has drawn its first frames.
+    func pageReady(in webView: WKWebView) {
+        guard let id = tabID(for: webView) else { return }
+        pageDidPaint(id)
+    }
+
+    /// The page on screen has drawn: whatever covers it fades away (the view
+    /// animates on `paintedTabs`), and the picture goes once it's faded.
+    private func pageDidPaint(_ id: UUID) {
+        coveredTabs.remove(id)
+        coverTimeouts[id]?.cancel()
+        coverTimeouts[id] = nil
+        if !paintedTabs.contains(id) { paintedTabs.insert(id) }
+        guard pageCovers[id] != nil else { return }
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard let self, self.paintedTabs.contains(id) else { return }
+            self.pageCovers[id] = nil
+        }
+    }
+
+    /// Drops a tab's crossfade bookkeeping. The cover itself, which views
+    /// observe, is removed by the caller when it's safe to change state.
+    private func clearCover(for id: UUID) {
+        pictureTasks[id]?.cancel()
+        pictureTasks[id] = nil
+        coverTimeouts[id]?.cancel()
+        coverTimeouts[id] = nil
+        leavingPictures[id] = nil
+        coveredTabs.remove(id)
     }
 
     // MARK: - Page actions
@@ -635,5 +787,49 @@ final class BrowserSession {
 private extension Comparable {
     func clamped(to range: ClosedRange<Self>) -> Self {
         min(max(self, range.lowerBound), range.upperBound)
+    }
+}
+
+/// Lets a page tell the session it has drawn: a script, in a world of its
+/// own that the page's scripts can't see or call, posts once the page has
+/// laid out and painted its first frames.
+///
+/// Content controllers keep their message handlers alive, so this holds the
+/// session weakly rather than being the session itself.
+@MainActor
+final class PageReadyHandler: NSObject, WKScriptMessageHandler {
+    static let name = "auraPageReady"
+
+    weak var session: BrowserSession?
+
+    /// After the page's HTML is in, two animation frames: the first is laid
+    /// out, the second means it has been painted.
+    static var script: WKUserScript {
+        WKUserScript(
+            source: """
+            (function () {
+              function ready() {
+                requestAnimationFrame(function () {
+                  requestAnimationFrame(function () {
+                    try { window.webkit.messageHandlers.\(name).postMessage(1); } catch (e) {}
+                  });
+                });
+              }
+              if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", ready, { once: true });
+              } else {
+                ready();
+              }
+            })();
+            """,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+            in: .defaultClient
+        )
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let webView = message.webView else { return }
+        session?.pageReady(in: webView)
     }
 }

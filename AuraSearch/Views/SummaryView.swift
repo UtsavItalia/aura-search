@@ -104,7 +104,7 @@ struct SummaryView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .contentTransition(.numericText())
-                    .animation(.snappy, value: status)
+                    .animation(Motion.quick, value: status)
                 PlaceholderLines()
             }
         case .writing, .done:
@@ -174,7 +174,7 @@ private struct SummaryBody: View {
             }
         }
         .textSelection(.enabled)
-        .animation(.easeOut(duration: 0.2), value: outline.bullets.count)
+        .animation(Motion.fade, value: outline.bullets.count)
     }
 }
 
@@ -190,7 +190,7 @@ private struct PlaceholderLines: View {
             line(trailing: 120)
         }
         .opacity(dimmed ? 0.4 : 1)
-        .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: dimmed)
+        .animation(Motion.pulse, value: dimmed)
         .onAppear { dimmed = true }
         .accessibilityHidden(true)
     }

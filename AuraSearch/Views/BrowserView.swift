@@ -37,6 +37,13 @@ struct BrowserView: View {
         return transition.progress
     }
 
+    /// 0 as a newly opened page starts growing in (from a search, or a link
+    /// that opens a tab), 1 once it's in place, and for every other page.
+    private var arrivalProgress: CGFloat {
+        guard let arrival = session.arrival, arrival.tabID == tab.id else { return 1 }
+        return arrival.progress
+    }
+
     var body: some View {
         let t = cardProgress
         let page = metrics.pageRect
@@ -45,28 +52,42 @@ struct BrowserView: View {
         let scale = 1 + (ratio - 1) * t
         let dx = (card.minX - page.minX) * t
         let dy = (card.minY - page.minY) * t
+        // A new page grows in from a little smaller, with rounded corners.
+        let a = arrivalProgress
+        let arrivalScale = 0.94 + 0.06 * a
         // Drawn before scaling, so it lands on the card's 22pt corners.
-        let shape = RoundedRectangle(cornerRadius: t * DeckLayout.cornerRadius / max(ratio, 0.05), style: .continuous)
+        let cornerRadius = max(t * DeckLayout.cornerRadius / max(ratio, 0.05), (1 - a) * 32)
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
 
         ZStack(alignment: .topLeading) {
+            // An arriving page comes in over the tab screen's backdrop.
+            if a < 1 {
+                PastelBackground(tint: tint)
+                    .frame(width: metrics.width, height: metrics.height)
+            }
+
             // Behind the status bar.
             Color(.systemBackground)
                 .frame(width: metrics.width, height: page.minY)
-                .opacity(Double(1 - t))
+                .opacity(Double((1 - t) * a))
 
             // The card's shadow, cast while the page moves.
             shape
                 .fill(Color(.systemBackground))
                 .shadow(color: .black.opacity(0.18 * Double(t)), radius: 16, x: -6, y: 6)
                 .frame(width: page.width, height: page.height)
+                .scaleEffect(arrivalScale)
                 .scaleEffect(scale, anchor: .topLeading)
                 .offset(x: page.minX + dx, y: page.minY + dy)
+                .opacity(Double(a))
 
             pageContent
                 .frame(width: page.width, height: page.height)
                 .clipShape(shape)
+                .scaleEffect(arrivalScale)
                 .scaleEffect(scale, anchor: .topLeading)
                 .offset(x: page.minX + dx, y: page.minY + dy)
+                .opacity(Double(a))
 
             bottomBar
                 .opacity(Double(1 - t))
@@ -110,7 +131,7 @@ struct BrowserView: View {
 
     private var pageContent: some View {
         WebViewContainer(webView: session.webView(for: tab), bottomInset: metrics.barHeight)
-            .overlay { loadingSnapshot }
+            .overlay { loadingCover }
             .overlay {
                 // A private page turns to frosted glass as it lands in the deck.
                 if tab.isPrivate {
@@ -119,21 +140,28 @@ struct BrowserView: View {
                         .allowsHitTesting(false)
                 }
             }
-            .animation(.easeOut(duration: 0.25), value: session.paintedTabs.contains(tab.id))
+            .animation(Motion.crossfade, value: session.paintedTabs.contains(tab.id))
     }
 
-    /// The tab's last snapshot, shown until a reloading page has drawn,
-    /// so opening a tab never flashes a blank page.
+    /// What shows until the page has drawn, so pages never blink or flash
+    /// blank: the picture of the page a link is leaving, or the tab's last
+    /// snapshot (a tab reloading), or a plain sheet instead of WebKit's
+    /// empty white. It appears at once and fades away once the page draws.
     @ViewBuilder
-    private var loadingSnapshot: some View {
-        if !session.paintedTabs.contains(tab.id), let snapshot = session.snapshots.images[tab.id] {
-            Image(uiImage: snapshot)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    private var loadingCover: some View {
+        if !session.paintedTabs.contains(tab.id), tab.url != nil {
+            Color(.systemBackground)
+                .overlay(alignment: .top) {
+                    if let picture = session.pageCovers[tab.id] ?? session.snapshots.images[tab.id] {
+                        // Width-fitted from the top, the way it was taken.
+                        Image(uiImage: picture)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                    }
+                }
                 .clipped()
                 .allowsHitTesting(false)
-                .transition(.opacity)
+                .transition(.asymmetric(insertion: .identity, removal: .opacity))
         }
     }
 
@@ -148,7 +176,7 @@ struct BrowserView: View {
                     .fill(tint)
                     .frame(width: metrics.width * CGFloat(session.progress), height: 2)
                     .frame(width: metrics.width, alignment: .leading)
-                    .animation(.linear(duration: 0.2), value: session.progress)
+                    .animation(Motion.progress, value: session.progress)
             }
 
             HStack(spacing: 0) {

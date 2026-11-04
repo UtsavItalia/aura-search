@@ -5,9 +5,16 @@ import WebKit
 /// not here, so switching tabs swaps views instead of reloading pages.
 struct WebViewContainer: UIViewRepresentable {
     let webView: WKWebView
-    /// The page runs under the bottom bar; this lets it scroll its last
-    /// stretch up above the bar.
+    /// How much of the page's bottom the bar covers.
     var bottomInset: CGFloat = 0
+
+    final class Coordinator {
+        var bottomConstraint: NSLayoutConstraint?
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
     func makeUIView(context: Context) -> UIView {
         let container = UIView()
@@ -21,12 +28,14 @@ struct WebViewContainer: UIViewRepresentable {
             webView.removeFromSuperview()
             webView.translatesAutoresizingMaskIntoConstraints = false
             container.addSubview(webView)
+            let bottom = webView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
             NSLayoutConstraint.activate([
                 webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
                 webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
                 webView.topAnchor.constraint(equalTo: container.topAnchor),
-                webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+                bottom,
             ])
+            context.coordinator.bottomConstraint = bottom
         }
 
         // The page's frame already starts below the status bar, so insets are
@@ -35,9 +44,38 @@ struct WebViewContainer: UIViewRepresentable {
         if scrollView.contentInsetAdjustmentBehavior != .never {
             scrollView.contentInsetAdjustmentBehavior = .never
         }
-        if scrollView.contentInset.bottom != bottomInset {
-            scrollView.contentInset.bottom = bottomInset
-            scrollView.verticalScrollIndicatorInsets.bottom = bottomInset
+
+        // The page runs under the bottom bar, as in Arc. WebKit has to be told
+        // the bar covers it, or anything a page pins to the bottom of the
+        // screen (cookie banners and their buttons, chat buttons) sits hidden
+        // behind the bar: WebKit ignores scroll insets when it places those.
+        // iOS 26 lets apps say so. Before that, the page stops at the bar.
+        let marksBarAsCovering = Self.canMarkBarAsCovering
+        let scrollInset = marksBarAsCovering ? bottomInset : 0
+        if scrollView.contentInset.bottom != scrollInset {
+            scrollView.contentInset.bottom = scrollInset
+            scrollView.verticalScrollIndicatorInsets.bottom = scrollInset
         }
+        let frameInset = marksBarAsCovering ? 0 : bottomInset
+        if let bottom = context.coordinator.bottomConstraint, bottom.constant != -frameInset {
+            bottom.constant = -frameInset
+        }
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            let covered = UIEdgeInsets(top: 0, left: 0, bottom: bottomInset, right: 0)
+            if webView.obscuredContentInsets != covered {
+                webView.obscuredContentInsets = covered
+            }
+        }
+        #endif
+    }
+
+    /// Whether WebKit can be told about the bar (iOS 26 and later, built
+    /// with Xcode 26 or later).
+    private static var canMarkBarAsCovering: Bool {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) { return true }
+        #endif
+        return false
     }
 }

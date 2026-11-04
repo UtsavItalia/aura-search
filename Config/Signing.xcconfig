@@ -1,0 +1,13 @@
+// Code signing for every target: the app and its tests.
+//
+// Your Apple team ID goes in Config/Local.xcconfig, which isn't committed,
+// so it survives `xcodegen generate` and stays out of the public repo:
+//
+//     DEVELOPMENT_TEAM = ABCDE12345
+//
+// Find it in Xcode > Settings > Accounts (select your team), or on
+// developer.apple.com under Membership. A free Personal Team works.
+
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

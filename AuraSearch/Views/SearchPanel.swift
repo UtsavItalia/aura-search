@@ -13,9 +13,14 @@ struct SearchPanel: View {
 
     @State private var query = ""
     @State private var suggestions: [String] = []
+    /// The address from history that what you're typing completes to, like
+    /// "google.com" for "goo". Shown highlighted after the cursor; Go opens it.
+    @State private var completion: String?
+    @State private var previousQuery = ""
     @FocusState private var fieldFocused: Bool
-    /// Pulling the panel down past this closes it.
-    @GestureState private var pullDown: CGFloat = 0
+    /// How far the panel has been pulled down. Kept when you let go past
+    /// the threshold, so it carries on down from there instead of jumping back.
+    @State private var dragOffset: CGFloat = 0
 
     private var trimmedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -57,18 +62,33 @@ struct SearchPanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background { panelBackground(isPrivate: isPrivate) }
-        .offset(y: max(pullDown, 0))
+        .offset(y: dragOffset)
         // Private browsing turns the whole panel, keyboard included, dark.
         .environment(\.colorScheme, isPrivate ? .dark : colorScheme)
         .animation(.easeInOut(duration: 0.25), value: isPrivate)
         .sensoryFeedback(.selection, trigger: isPrivate)
+        // Focus straight away, so the keyboard rises with the panel.
+        .onAppear { fieldFocused = true }
         .task {
-            // A beat after the sheet appears, or the focus doesn't take.
-            try? await Task.sleep(for: .milliseconds(80))
-            fieldFocused = true
+            // In case the first focus didn't take while the panel was appearing.
+            try? await Task.sleep(for: .milliseconds(250))
+            if !fieldFocused, !session.isSearchClosing { fieldFocused = true }
+        }
+        .onChange(of: session.isSearchClosing) { _, closing in
+            if closing {
+                fieldFocused = false
+            } else if session.isSearchPresented {
+                // Brought back up on its way out: it never left the screen,
+                // so it has to take the keyboard back itself.
+                withAnimation(BrowserSession.searchAnimation) { dragOffset = 0 }
+                fieldFocused = true
+            }
         }
         .task(id: suggestionKey) {
             await loadSuggestions()
+        }
+        .onChange(of: query) { _, newValue in
+            updateCompletion(for: newValue)
         }
     }
 
@@ -86,14 +106,19 @@ struct SearchPanel: View {
             .ignoresSafeArea()
     }
 
+    /// Pulling the panel down past 70pt, or flicking it, closes it.
     private var pullToClose: some Gesture {
         DragGesture(minimumDistance: 12)
-            .updating($pullDown) { value, state, _ in
-                state = value.translation.height
+            .onChanged { value in
+                guard !session.isSearchClosing else { return }
+                dragOffset = max(value.translation.height, 0)
             }
             .onEnded { value in
+                guard !session.isSearchClosing else { return }
                 if value.translation.height > 70 || value.predictedEndTranslation.height > 200 {
                     close()
+                } else {
+                    withAnimation(BrowserSession.searchAnimation) { dragOffset = 0 }
                 }
             }
     }
@@ -108,13 +133,14 @@ struct SearchPanel: View {
     private var searchField: some View {
         HStack(spacing: 10) {
             TextField("Search…", text: $query)
-                .font(.title3)
+                .font(.body)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(.webSearch)
                 .submitLabel(.go)
                 .focused($fieldFocused)
-                .onSubmit { open(trimmedQuery) }
+                .onSubmit { open(completion ?? trimmedQuery) }
+                .overlay(alignment: .leading) { completionGhost }
 
             privateToggle
 
@@ -123,7 +149,7 @@ struct SearchPanel: View {
                     query = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
+                        .font(.body)
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.secondary)
                 }
@@ -131,11 +157,47 @@ struct SearchPanel: View {
                 .accessibilityLabel("Clear")
             }
         }
-        .padding(.leading, 22)
+        .padding(.leading, 20)
         .padding(.trailing, 14)
-        .frame(height: 58)
-        .background(Color.primary.opacity(0.07), in: Capsule())
+        .frame(height: 48)
+        .background(Color.primary.opacity(0.1), in: Capsule())
         .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+    }
+
+    /// The rest of the completed address, drawn right after what you typed
+    /// and highlighted like a selection, as in Arc and Safari.
+    @ViewBuilder
+    private var completionGhost: some View {
+        if let suffix = completionSuffix {
+            HStack(spacing: 0) {
+                Text(query).hidden()
+                Text(suffix)
+                    .background(Color.accentColor.opacity(0.28))
+            }
+            .font(.body)
+            .lineLimit(1)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+    }
+
+    private var completionSuffix: String? {
+        // Long text scrolls inside the field, where the overlay can't follow.
+        guard let completion, query.count < 28, completion.count > query.count,
+              completion.lowercased().hasPrefix(query.lowercased()) else { return nil }
+        return String(completion.dropFirst(query.count))
+    }
+
+    /// Completes only while you type forwards. Deleting drops the
+    /// completion, so backspace never fights you.
+    private func updateCompletion(for newValue: String) {
+        defer { previousQuery = newValue }
+        let typingForward = newValue.count > previousQuery.count && newValue.hasPrefix(previousQuery)
+        guard typingForward, !newValue.hasSuffix(" ") else {
+            completion = nil
+            return
+        }
+        completion = session.history.completion(for: newValue)
     }
 
     /// Just an icon when off; "Private" spelled out when on.
@@ -205,6 +267,14 @@ struct SearchPanel: View {
 
     @ViewBuilder
     private var typingRows: some View {
+        if let completion {
+            row(systemImage: "globe") {
+                open(completion)
+            } label: {
+                highlighted(completion)
+            }
+        }
+
         if let address = typedAddress {
             row(systemImage: "globe") {
                 open(trimmedQuery)
@@ -217,6 +287,10 @@ struct SearchPanel: View {
             } label: {
                 Text(trimmedQuery)
             }
+        }
+
+        ForEach(visitedSites) { entry in
+            historyRow(entry)
         }
 
         ForEach(suggestions, id: \.self) { suggestion in
@@ -260,6 +334,17 @@ struct SearchPanel: View {
             + Text(rest).fontWeight(.semibold)
     }
 
+    /// Pages you've visited that match, best first. Leaves out the site
+    /// already completed above and pages open in a tab (listed below).
+    private var visitedSites: [HistoryEntry] {
+        let openTabs = Set(store.tabs.compactMap { $0.url.map(HistoryStore.key(for:)) })
+        return session.history
+            .matches(for: trimmedQuery, limit: 4, excluding: openTabs)
+            .filter { $0.displayURL.lowercased() != completion }
+            .prefix(3)
+            .map { $0 }
+    }
+
     /// Open tabs whose title or address contains the text.
     private var matchingTabs: [BrowserTab] {
         let needle = trimmedQuery.lowercased()
@@ -296,22 +381,48 @@ struct SearchPanel: View {
             Button(action: action) {
                 HStack(spacing: 16) {
                     Image(systemName: systemImage)
-                        .font(.title3)
+                        .font(.body)
                         .foregroundStyle(.secondary)
-                        .frame(width: 28)
+                        .frame(width: 24)
                     label()
-                        .font(.title3)
+                        .font(.body)
                         .lineLimit(1)
                     Spacer(minLength: 0)
                 }
                 .padding(.leading, 24)
-                .frame(minHeight: 56)
+                .frame(minHeight: 50)
                 .contentShape(Rectangle())
             }
             .buttonStyle(RowButtonStyle())
             trailing()
                 .padding(.trailing, 12)
         }
+    }
+
+    private func historyRow(_ entry: HistoryEntry) -> some View {
+        Button {
+            open(entry.url.absoluteString)
+        } label: {
+            HStack(spacing: 14) {
+                FaviconView(url: entry.url, title: entry.displayTitle, tint: .gray)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(entry.displayTitle)
+                        .lineLimit(1)
+                    Text(entry.displayURL)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "clock.arrow.circlepath")
+                    .foregroundStyle(.tertiary)
+                    .accessibilityLabel("From history")
+            }
+            .padding(.horizontal, 22)
+            .frame(minHeight: 52)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(RowButtonStyle())
     }
 
     private func tabRow(_ tab: BrowserTab) -> some View {
@@ -335,7 +446,7 @@ struct SearchPanel: View {
                     .accessibilityLabel("Switch to tab")
             }
             .padding(.horizontal, 22)
-            .frame(minHeight: 56)
+            .frame(minHeight: 52)
             .contentShape(Rectangle())
         }
         .buttonStyle(RowButtonStyle())

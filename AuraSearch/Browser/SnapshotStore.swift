@@ -24,7 +24,7 @@ final class SnapshotStore {
     static let memoryLimit = 24
     /// Render scale of stored previews. Screens are 3x; cards are smaller
     /// than the screen, so 1.5x still looks sharp.
-    static let renderScale: CGFloat = 1.5
+    nonisolated static let renderScale: CGFloat = 1.5
 
     private let directory: URL?
     @ObservationIgnored private var loadOrder: [UUID] = []
@@ -39,41 +39,57 @@ final class SnapshotStore {
             .appendingPathComponent("Snapshots", isDirectory: true)
     }
 
-    /// Snapshots a web view that's on screen. Private tabs pass
+    /// Snapshots a web view that's on screen and keeps it. Private tabs pass
     /// `savesToDisk: false`, so their pages never leave memory.
     func capture(_ webView: WKWebView, for id: UUID, savesToDisk: Bool = true) async {
-        guard webView.window != nil, webView.bounds.width > 0, webView.bounds.height > 0 else { return }
+        guard let image = await captureImage(of: webView) else { return }
+        await keep(image, for: id, savesToDisk: savesToDisk)
+    }
 
+    /// Just the screenshot, as fast as possible, for the zoom to start from
+    /// at once. Hand it to `keep(_:for:savesToDisk:)` afterwards.
+    func captureImage(of webView: WKWebView) async -> UIImage? {
+        guard webView.window != nil, webView.bounds.width > 0, webView.bounds.height > 0 else { return nil }
         let configuration = WKSnapshotConfiguration()
         configuration.afterScreenUpdates = false
-        let image: UIImage? = await withCheckedContinuation { continuation in
+        return await withCheckedContinuation { continuation in
             webView.takeSnapshot(with: configuration) { image, _ in
                 continuation.resume(returning: image)
             }
         }
-        guard let image else { return }
+    }
 
-        let preview = Self.downscaled(image)
-        insert(preview, for: id)
+    /// Shrinks the screenshot and makes its blurred card version off the
+    /// main thread, so neither holds up an animation, then keeps both.
+    func keep(_ image: UIImage, for id: UUID, savesToDisk: Bool) async {
+        let (preview, card) = await Task.detached(priority: .userInitiated) {
+            let preview = Self.downscaled(image)
+            return (preview, Self.cardPreview(from: preview))
+        }.value
+        insert(preview, card: card, for: id)
         if savesToDisk { save(preview, for: id) }
     }
 
     /// Loads a cached snapshot from disk if it isn't in memory yet.
     func loadIfNeeded(_ id: UUID) async {
         guard images[id] == nil, let image = await loadFromDisk(id) else { return }
+        let card = await Task.detached(priority: .utility) { Self.cardPreview(from: image) }.value
         guard images[id] == nil else { return }
-        insert(image, for: id)
+        insert(image, card: card, for: id)
     }
 
     /// Loads just the card preview, without keeping the full image in memory.
     func loadCardPreviewIfNeeded(_ id: UUID) async {
         guard cardPreviews[id] == nil else { return }
+        let source: UIImage?
         if let image = images[id] {
-            cardPreviews[id] = Self.cardPreview(from: image)
-            return
+            source = image
+        } else {
+            source = await loadFromDisk(id)
         }
-        guard let image = await loadFromDisk(id), cardPreviews[id] == nil else { return }
-        cardPreviews[id] = Self.cardPreview(from: image)
+        guard let source else { return }
+        let card = await Task.detached(priority: .utility) { Self.cardPreview(from: source) }.value
+        if cardPreviews[id] == nil { cardPreviews[id] = card }
     }
 
     private func loadFromDisk(_ id: UUID) async -> UIImage? {
@@ -96,9 +112,9 @@ final class SnapshotStore {
 
     // MARK: - Private
 
-    private func insert(_ image: UIImage, for id: UUID) {
+    private func insert(_ image: UIImage, card: UIImage?, for id: UUID) {
         images[id] = image
-        cardPreviews[id] = Self.cardPreview(from: image)
+        cardPreviews[id] = card
         loadOrder.removeAll { $0 == id }
         loadOrder.append(id)
         while loadOrder.count > Self.memoryLimit {
@@ -119,12 +135,14 @@ final class SnapshotStore {
         directory?.appendingPathComponent("\(id.uuidString).jpg")
     }
 
-    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+    // Core Image and the image renderer are safe off the main thread, so
+    // these run in background tasks.
+    nonisolated(unsafe) private static let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     /// Shrinks the page to a few dozen pixels, then blurs it. Shrinking first
     /// averages away text and edges entirely, so what's left is smooth color;
     /// blurring a full-size page instead leaves streaks where text was.
-    private static func cardPreview(from image: UIImage) -> UIImage? {
+    nonisolated private static func cardPreview(from image: UIImage) -> UIImage? {
         guard let cgImage = image.cgImage else { return nil }
         let input = CIImage(cgImage: cgImage)
         guard input.extent.width > 0 else { return nil }
@@ -143,12 +161,27 @@ final class SnapshotStore {
         return UIImage(cgImage: output)
     }
 
-    private static func downscaled(_ image: UIImage) -> UIImage {
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = min(renderScale, image.scale)
-        format.opaque = true
-        return UIGraphicsImageRenderer(size: image.size, format: format).image { _ in
-            image.draw(in: CGRect(origin: .zero, size: image.size))
-        }
+    /// Redraws the screenshot at a lower resolution with Core Graphics,
+    /// which is safe on any thread.
+    nonisolated private static func downscaled(_ image: UIImage) -> UIImage {
+        guard let source = image.cgImage else { return image }
+        let targetScale = min(renderScale, image.scale)
+        let factor = targetScale / image.scale
+        let width = Int((CGFloat(source.width) * factor).rounded())
+        let height = Int((CGFloat(source.height) * factor).rounded())
+        guard width > 0, height > 0,
+              let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+              ) else { return image }
+        context.interpolationQuality = .high
+        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let output = context.makeImage() else { return image }
+        return UIImage(cgImage: output, scale: targetScale, orientation: .up)
     }
 }

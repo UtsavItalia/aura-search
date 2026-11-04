@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 import UIKit
 import WebKit
 
@@ -23,14 +24,24 @@ final class BrowserSession {
     /// Tabs whose web view has drawn its page. Until then the browser shows
     /// the tab's snapshot, instead of a blank page while it reloads.
     private(set) var paintedTabs: Set<UUID> = []
-    /// Whether the search sheet is up.
-    var isSearchPresented = false
+    /// The page shrinking into its card, or a card growing into its page,
+    /// while you move between a tab and the tab screen. `nil` when still.
+    private(set) var transition: TabTransition?
+    /// Whether the search panel is up.
+    private(set) var isSearchPresented = false
+    /// True while the panel slides down with the keyboard on its way out.
+    /// It's removed once it's out of sight.
+    private(set) var isSearchClosing = false
     /// Whether searches from the search sheet open private tabs.
     var prefersPrivateTabs = false
 
     let store: TabStore
     /// Page previews for the home screen's tab cards.
     let snapshots: SnapshotStore
+    /// Pages you've visited, for autocomplete and the History screen.
+    let history: HistoryStore
+    /// Files downloaded from pages.
+    let downloads: DownloadManager
 
     /// How many web views to keep alive. Each one is a separate WebKit
     /// process's worth of memory, so this stays small.
@@ -45,6 +56,15 @@ final class BrowserSession {
     /// Back/forward history of web views dropped to save memory.
     @ObservationIgnored private var savedStates: [UUID: Any] = [:]
     @ObservationIgnored private var hasHandledLaunch = false
+    /// The tab each new tab was opened from, for going back to it if the
+    /// new tab turns out to be only a download.
+    @ObservationIgnored private var openers: [UUID: UUID] = [:]
+    /// Bumped whenever the search panel opens or starts closing, so a close
+    /// that's been overtaken by a reopen doesn't remove the panel.
+    @ObservationIgnored private var searchGeneration = 0
+    /// The screen, as measured by the root view, for working out where a
+    /// page's card will be before the tab screen is on screen.
+    @ObservationIgnored var metrics = ScreenMetrics()
     /// Cookies and storage shared by private tabs, kept in memory only.
     /// Dropped when the last private tab closes, so the next private
     /// session starts clean.
@@ -53,6 +73,8 @@ final class BrowserSession {
     init(store: TabStore) {
         self.store = store
         self.snapshots = SnapshotStore()
+        self.history = HistoryStore()
+        self.downloads = DownloadManager()
         self.contentBlocker = ContentBlocker()
         self.delegate = WebViewDelegate()
         delegate.session = self
@@ -157,6 +179,7 @@ final class BrowserSession {
     /// Drops everything kept for a tab that was closed.
     private func forget(_ id: UUID) {
         savedStates[id] = nil
+        openers[id] = nil
         desktopSiteTabs.remove(id)
         snapshots.remove(id)
         discardWebView(id)
@@ -194,6 +217,9 @@ final class BrowserSession {
         guard let webView = webViews[tabID] else { return }
         let title = webView.title.flatMap { $0.isEmpty ? nil : $0 }
         store.updateTab(tabID, url: webView.url, title: title)
+        if let title, let url = webView.url, !isPrivateTab(tabID) {
+            history.updateTitle(title, for: url)
+        }
     }
 
     private func navigationStateChanged(_ tabID: UUID) {
@@ -224,13 +250,29 @@ final class BrowserSession {
 
     /// Opens what was typed in a new tab, in the current Space.
     func openNewTab(from input: String, isPrivate: Bool = false) {
-        guard let url = URLResolver.resolve(input, engine: store.settings.searchEngine) else { return }
-        store.openTab(url: url, isPrivate: isPrivate)
+        let engine = store.settings.searchEngine
+        guard let url = URLResolver.resolve(input, engine: engine) else { return }
+        // An address you typed yourself ranks higher in autocomplete.
+        if !isPrivate, url != engine.searchURL(for: input.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            history.recordTyped(url)
+        }
+        let previous = store.activeTabID
+        let tab = store.openTab(url: url, isPrivate: isPrivate)
+        if let previous { openers[tab.id] = previous }
         refreshNavigationState()
     }
 
-    /// Shows the search sheet, for "+" and at launch.
+    /// How the search panel comes up, and comes back if reopened on its way out.
+    static let searchAnimation = Animation.spring(response: 0.36, dampingFraction: 0.9)
+    /// How it leaves: about as long as the keyboard takes, with no bounce.
+    static let searchCloseAnimation = Animation.spring(duration: 0.3, bounce: 0)
+
+    /// Shows the search panel, for "+" and at launch.
     func presentSearch() {
+        searchGeneration += 1
+        if isSearchClosing {
+            withAnimation(Self.searchAnimation) { isSearchClosing = false }
+        }
         isSearchPresented = true
     }
 
@@ -253,40 +295,182 @@ final class BrowserSession {
     }
 
     /// Links that open a new window stay private if they came from a private tab.
-    func openTabFromPage(_ url: URL) {
-        let opener = store.activeTab
-        store.openTab(url: url, in: opener?.spaceID, isPrivate: opener?.isPrivate ?? false)
+    func openTabFromPage(_ url: URL, openedBy webView: WKWebView? = nil) {
+        let openerID = webView.flatMap { tabID(for: $0) } ?? store.activeTabID
+        let opener = store.tabs.first { $0.id == openerID }
+        let tab = store.openTab(url: url, in: opener?.spaceID, isPrivate: opener?.isPrivate ?? false)
+        if let opener { openers[tab.id] = opener.id }
         refreshNavigationState()
     }
 
+    /// A page has started a download. If that was all a new tab was opened
+    /// for, the tab would sit there blank, so it closes and you're back on
+    /// the page you came from, as in Safari.
+    func downloadStarted(in webView: WKWebView) {
+        guard webView.backForwardList.currentItem == nil,
+              let id = tabID(for: webView) else { return }
+        // A moment later, once WebKit has handed the load over to the download.
+        Task { @MainActor [weak self] in
+            guard let self, self.store.tabs.contains(where: { $0.id == id }) else { return }
+            let opener = self.openers[id]
+            let wasOnScreen = self.store.activeTabID == id
+            self.store.discardTab(id)
+            self.forget(id)
+            if wasOnScreen, let opener, self.store.tabs.contains(where: { $0.id == opener }) {
+                self.store.activate(opener)
+            }
+            self.refreshNavigationState()
+        }
+    }
+
+    /// Opens a tab straight away, with no zoom: from search, history and
+    /// the archive.
     func activate(_ id: UUID) {
+        guard transition == nil else { return }
         store.activate(id)
         refreshNavigationState()
     }
 
+    // MARK: - Moving between a page and the tab screen
+
+    /// The page shrinking into its card, or a card growing into its page.
+    struct TabTransition: Equatable {
+        enum Direction {
+            case toDeck
+            case toPage
+        }
+
+        let tabID: UUID
+        let direction: Direction
+        /// 0 is the full page, 1 the card in the deck. Animated in between.
+        var progress: CGFloat
+        /// Where the card's page is on screen.
+        let cardRect: CGRect
+        /// Where the deck rests meanwhile.
+        let deckPosition: CGFloat
+    }
+
+    /// Quick with a soft landing, like the iOS app switcher.
+    static let transitionAnimation = Animation.spring(duration: 0.36, bounce: 0.1)
+
+    /// Back to the tab screen: the live page shrinks into its card while
+    /// the other cards fly out of the tabs button, as in Arc.
     func showHome() {
-        guard let id = store.activeTabID, let webView = webViews[id] else {
+        guard transition == nil else { return }
+        guard let tab = store.activeTab else {
             store.showHome()
             refreshNavigationState()
             return
         }
-        // Snapshot first: once the home screen is up, the web view is off
-        // screen and can't be captured.
-        Task {
-            await snapshots.capture(webView, for: id, savesToDisk: !isPrivateTab(id))
-            guard store.activeTabID == id else { return }
+        let id = tab.id
+        let webView = webViews[id]
+        // The card needs a fresh picture of the page. Taken now, while the
+        // page is still on screen, alongside the animation rather than before it.
+        let capture: Task<Void, Never>? = webView.map { webView in
+            let savesToDisk = !tab.isPrivate
+            return Task { [snapshots = self.snapshots] in
+                guard let image = await snapshots.captureImage(of: webView) else { return }
+                await snapshots.keep(image, for: id, savesToDisk: savesToDisk)
+            }
+        }
+
+        let tabs = store.tabs(in: tab.spaceID)
+        guard metrics.isValid, webView != nil, let index = tabs.firstIndex(where: { $0.id == id }) else {
             store.showHome()
             refreshNavigationState()
+            return
+        }
+        let position = DeckLayout.openingPosition(currentIndex: index, count: tabs.count)
+        transition = TabTransition(
+            tabID: id,
+            direction: .toDeck,
+            progress: 0,
+            cardRect: DeckLayout.previewRect(u: CGFloat(index) - position, in: metrics),
+            deckPosition: position
+        )
+        // Next frame, once the tab screen is drawn under the page.
+        Task {
+            withAnimation(Self.transitionAnimation) {
+                transition?.progress = 1
+            } completion: { [weak self] in
+                Task { @MainActor [weak self] in
+                    // The card shows the new picture the moment the page goes,
+                    // but never waits more than a moment for it.
+                    if let capture {
+                        await withTaskGroup(of: Void.self) { group in
+                            group.addTask { await capture.value }
+                            group.addTask { try? await Task.sleep(for: .milliseconds(400)) }
+                            _ = await group.next()
+                            group.cancelAll()
+                        }
+                    }
+                    guard let self, self.transition?.tabID == id else { return }
+                    self.store.showHome()
+                    self.transition = nil
+                    self.refreshNavigationState()
+                }
+            }
         }
     }
 
-    func dismissSearch() {
-        isSearchPresented = false
+    /// From the tab screen: the card grows into the live page.
+    /// - Parameter cardRect: where the card's page is on screen right now.
+    func open(_ id: UUID, fromCard cardRect: CGRect, deckPosition: CGFloat) {
+        guard transition == nil else { return }
+        guard metrics.isValid else {
+            activate(id)
+            return
+        }
+        transition = TabTransition(
+            tabID: id,
+            direction: .toPage,
+            progress: 1,
+            cardRect: cardRect,
+            deckPosition: deckPosition
+        )
+        store.activate(id)
+        refreshNavigationState()
+        Task {
+            withAnimation(Self.transitionAnimation) {
+                transition?.progress = 0
+            } completion: { [weak self] in
+                if self?.transition?.tabID == id { self?.transition = nil }
+            }
+        }
     }
 
-    /// Keeps the tab's card preview fresh after a page finishes loading.
+    /// Closes the search panel. The keyboard starts down straight away and
+    /// the panel rides down on it, slipping behind it, so the two leave as
+    /// one, like Arc. Left to SwiftUI, the keyboard only went once the text
+    /// field had been removed, trailing behind the panel.
+    func dismissSearch() {
+        guard isSearchPresented, !isSearchClosing else { return }
+        _ = UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        searchGeneration += 1
+        let generation = searchGeneration
+        withAnimation(Self.searchCloseAnimation) {
+            isSearchClosing = true
+        } completion: { [weak self] in
+            guard let self, self.searchGeneration == generation else { return }
+            // Out of sight by now, so it just goes.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                self.isSearchPresented = false
+                self.isSearchClosing = false
+            }
+        }
+    }
+
+    /// Keeps the tab's card preview fresh after a page finishes loading,
+    /// and records the visit (never for private tabs).
     func pageDidFinishLoading(in webView: WKWebView) {
-        if let id = tabID(for: webView) { paintedTabs.insert(id) }
+        if let id = tabID(for: webView) {
+            paintedTabs.insert(id)
+            if !isPrivateTab(id), let url = webView.url {
+                history.recordVisit(url: url, title: webView.title)
+            }
+        }
         guard let id = store.activeTabID, webViews[id] === webView else { return }
         Task { await snapshots.capture(webView, for: id, savesToDisk: !isPrivateTab(id)) }
     }
@@ -416,8 +600,9 @@ final class BrowserSession {
         return await UIApplication.shared.open(url, options: [.universalLinksOnly: true])
     }
 
-    /// Deletes cookies, caches and site storage for every site.
+    /// Deletes history, cookies, caches and site storage for every site.
     func clearBrowsingData() async {
+        history.clear()
         let dataStore = WKWebsiteDataStore.default()
         await dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
         URLCache.shared.removeAllCachedResponses()

@@ -6,6 +6,8 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingArchive = false
+    @State private var showingHistory = false
+    @State private var showingDownloads = false
     @State private var confirmingClearData = false
     @State private var clearedData = 0
 
@@ -24,6 +26,28 @@ struct SettingsView: View {
                             Text("\(store.archive.count)")
                         } label: {
                             Label("Archive", systemImage: "archivebox")
+                        }
+                    }
+                    .foregroundStyle(.primary)
+
+                    Button {
+                        showingHistory = true
+                    } label: {
+                        LabeledContent {
+                            Text("\(session.history.entries.filter { $0.visitCount > 0 }.count)")
+                        } label: {
+                            Label("History", systemImage: "clock")
+                        }
+                    }
+                    .foregroundStyle(.primary)
+
+                    Button {
+                        showingDownloads = true
+                    } label: {
+                        LabeledContent {
+                            Text("\(session.downloads.items.count)")
+                        } label: {
+                            Label("Downloads", systemImage: "arrow.down.circle")
                         }
                     }
                     .foregroundStyle(.primary)
@@ -139,19 +163,33 @@ struct SettingsView: View {
                     .environment(store)
                     .environment(session)
             }
+            .sheet(isPresented: $showingDownloads) {
+                DownloadsView()
+                    .environment(store)
+                    .environment(session)
+            }
+            .sheet(isPresented: $showingHistory) {
+                HistoryView { url in
+                    showingHistory = false
+                    dismiss()
+                    session.openNewTab(from: url.absoluteString)
+                }
+                .environment(store)
+                .environment(session)
+            }
             .confirmationDialog(
                 "Clear browsing data?",
                 isPresented: $confirmingClearData,
                 titleVisibility: .visible
             ) {
-                Button("Clear Cookies and Site Data", role: .destructive) {
+                Button("Clear History and Site Data", role: .destructive) {
                     Task {
                         await session.clearBrowsingData()
                         clearedData += 1
                     }
                 }
             } message: {
-                Text("You'll be signed out of websites. Your tabs, Spaces and Archive stay.")
+                Text("Removes your history, cookies and site data. You'll be signed out of websites. Your tabs, Spaces and Archive stay.")
             }
             .sensoryFeedback(.success, trigger: clearedData)
         }

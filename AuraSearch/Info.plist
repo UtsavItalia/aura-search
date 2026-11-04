@@ -22,7 +22,19 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Lets websites you allow use the camera, like for a video call or a photo upload.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Lets websites you allow see your location, like maps.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Lets websites you allow use the microphone, like for a video call.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Saves images you choose to your photo library.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>

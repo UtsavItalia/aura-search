@@ -32,31 +32,86 @@ struct PastelBackground: View {
     }
 }
 
-extension View {
-    /// The bar under a page: the system bar normally, and a solid charcoal
-    /// strip with light icons on private tabs, as in Arc Search.
-    func browserBar(isPrivate: Bool) -> some View {
-        modifier(BrowserBar(isPrivate: isPrivate))
+/// The round buttons at the ends of the bottom bar, sized like Arc's:
+/// a 34pt circle inside a bigger tap area.
+struct BarCircleButton: View {
+    let systemImage: String
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 16, weight: .medium))
+                .frame(width: BarMetrics.circle, height: BarMetrics.circle)
+                .background(Color.primary.opacity(0.07), in: Circle())
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(width: BarMetrics.tapSize, height: BarMetrics.tapSize)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel(label)
     }
 }
 
-private struct BrowserBar: ViewModifier {
-    let isPrivate: Bool
+/// The "+" capsule in the middle of the bottom bar.
+struct BarPlusButton: View {
+    let action: () -> Void
 
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if isPrivate {
-            content
-                .environment(\.colorScheme, .dark)
-                .foregroundStyle(.white)
-                .background {
-                    Color(red: 0.18, green: 0.18, blue: 0.20)
-                        .ignoresSafeArea(edges: .bottom)
-                }
-        } else {
-            content
-                .foregroundStyle(.primary)
-                .background(.bar, ignoresSafeAreaEdges: .bottom)
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.system(size: 20, weight: .medium))
+                .frame(width: BarMetrics.capsuleWidth, height: BarMetrics.height)
+                .background(Color.primary.opacity(0.07), in: Capsule())
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .contentShape(Capsule())
         }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel("New tab")
+    }
+}
+
+/// The tabs button under a page: your latest tabs as a tiny fanned
+/// stack, as in Arc. An icon until there's a page to show.
+struct TabStackButton: View {
+    /// Back to front: the tab before this one, then this one.
+    let images: [UIImage]
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                if images.isEmpty {
+                    Image(systemName: "square.on.square")
+                        .font(.system(size: 16, weight: .medium))
+                        .frame(width: BarMetrics.circle, height: BarMetrics.circle)
+                        .background(Color.primary.opacity(0.07), in: Circle())
+                } else {
+                    ForEach(Array(images.enumerated()), id: \.offset) { index, image in
+                        let isFront = index == images.count - 1
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 19, height: 29, alignment: .top)
+                            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.85), lineWidth: 1)
+                            )
+                            .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
+                            .rotationEffect(.degrees(isFront ? 9 : -13))
+                            .offset(x: isFront ? 4 : -4, y: isFront ? 1 : 0)
+                    }
+                }
+            }
+            .frame(width: BarMetrics.tapSize, height: BarMetrics.tapSize)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel("Tabs")
     }
 }

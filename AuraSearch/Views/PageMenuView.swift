@@ -6,6 +6,7 @@ struct PageMenuView: View {
     let tab: BrowserTab
     let onReader: () -> Void
     let onFind: () -> Void
+    let onDownloads: () -> Void
 
     @Environment(TabStore.self) private var store
     @Environment(BrowserSession.self) private var session
@@ -26,6 +27,7 @@ struct PageMenuView: View {
                 addressPill
                 tiles
                 pageOptions
+                downloadsRow
                 tabOptions
                 if store.settings.blocksTrackers, let host = tab.url?.host() {
                     trackerCard(host: host)
@@ -243,6 +245,31 @@ struct PageMenuView: View {
             .disabled(tab.url == nil)
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+        }
+        .buttonStyle(.plain)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    // MARK: - Downloads
+
+    private var downloadsRow: some View {
+        let active = session.downloads.activeCount
+        return Button(action: onDownloads) {
+            HStack {
+                Label("Downloads", systemImage: "arrow.down.circle")
+                Spacer()
+                if active > 0 {
+                    Text(active == 1 ? "1 in progress" : "\(active) in progress")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 20, style: .continuous))

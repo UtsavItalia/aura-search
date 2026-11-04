@@ -19,7 +19,7 @@ final class WebViewDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         if let url = navigationAction.request.url {
-            session?.openTabFromPage(url)
+            session?.openTabFromPage(url, openedBy: webView)
         }
         return nil
     }
@@ -41,6 +41,11 @@ final class WebViewDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             return (.cancel, preferences)
         }
 
+        // Links marked for saving, like <a download>.
+        if navigationAction.shouldPerformDownload {
+            return (.download, preferences)
+        }
+
         guard let session, navigationAction.targetFrame?.isMainFrame ?? true else {
             return (.allow, preferences)
         }
@@ -54,6 +59,39 @@ final class WebViewDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         preferences.preferredContentMode = session.prefersDesktopSite(webView) ? .desktop : .recommended
         session.applyContentBlocking(to: webView, host: url.host())
         return (.allow, preferences)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse
+    ) async -> WKNavigationResponsePolicy {
+        Self.shouldDownload(navigationResponse) ? .download : .allow
+    }
+
+    /// Saves files the server marks as attachments, which is how most
+    /// Download buttons work (Unsplash's included), and files a page can't
+    /// show, like zips. Anything else opens as usual, PDFs and images too.
+    private static func shouldDownload(_ navigationResponse: WKNavigationResponse) -> Bool {
+        if let http = navigationResponse.response as? HTTPURLResponse {
+            // Nothing to save from an error page or an empty reply.
+            guard (200..<300).contains(http.statusCode),
+                  http.statusCode != 204, http.statusCode != 205 else { return false }
+            if DownloadRules.isAttachment(http.value(forHTTPHeaderField: "Content-Disposition")) {
+                return true
+            }
+        }
+        // A frame inside a page that can't show its file is just left empty.
+        return navigationResponse.isForMainFrame && !navigationResponse.canShowMIMEType
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        session?.downloads.track(download)
+        session?.downloadStarted(in: webView)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        session?.downloads.track(download)
+        session?.downloadStarted(in: webView)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

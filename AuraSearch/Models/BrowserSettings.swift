@@ -96,6 +96,21 @@ enum SearchEngine: String, Codable, CaseIterable, Identifiable {
         }
     }
 
+    /// Whether a URL is this engine's results page, so history can skip it.
+    func isResultsPage(_ url: URL) -> Bool {
+        guard let host = url.host()?.lowercased() else { return false }
+        let path = url.path()
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let hasQuery = items.contains { ($0.name == "q" || $0.name == "query") && !($0.value ?? "").isEmpty }
+        switch self {
+        case .duckDuckGo: return host.hasSuffix("duckduckgo.com") && hasQuery
+        case .startpage: return host.hasSuffix("startpage.com") && (path.hasPrefix("/do/search") || path.hasPrefix("/sp/search"))
+        case .brave: return host == "search.brave.com" && path.hasPrefix("/search")
+        case .google: return host.contains("google.") && path.hasPrefix("/search")
+        case .bing: return host.hasSuffix("bing.com") && path.hasPrefix("/search")
+        }
+    }
+
     func searchURL(for query: String) -> URL? {
         let base: String
         switch self {

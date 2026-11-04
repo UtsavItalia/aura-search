@@ -14,11 +14,18 @@ the phone companion for Zen Browser on desktop.
   Tab cards invert for contrast: dark cards on light, light cards on dark.
 - **Search suggestions** — from your chosen search engine as you type, with
   matching open tabs. Off for private tabs, and can be turned off in Settings.
+- **Autocomplete and history** — type "goo" and it completes to a site you
+  visit, like google.com, with visited pages suggested underneath. History is
+  kept on the device only, never includes private tabs or search result pages,
+  and can be searched or cleared in Settings → History.
 - **Private tabs** — toggle private in the search panel, which turns solid dark. Private tabs keep
   cookies in memory only and are never saved, archived or snapshotted to disk.
 - **Spaces** — group tabs like Zen workspaces. Switch with the chips at the top.
-- **Tab cards** — each Space's tabs as a swipeable carousel with page previews,
-  pinned tabs first.
+- **Tab cards** — each Space's tabs as a deck like the iOS app switcher, laid
+  out from Arc Search measured on the same phone: each card is its page at 70%,
+  the next card overlaps from the right and earlier ones stack as dimmed
+  slivers on the left. The live page shrinks into its card (and grows back out)
+  while the other cards fly out of the tabs button.
 - **Swipe up to close, pull down to pin** — like closing apps in the iOS app
   switcher. Long-press a card to move it to another Space.
 - **Auto-archive** — unpinned tabs you haven't opened in 12 hours (configurable)
@@ -27,6 +34,10 @@ the phone companion for Zen Browser on desktop.
   Swipe up on the bar, or tap the arrow, for the page menu: address, back and
   forward, copy link, Find on Page, Reader, Pin, Share, page zoom and the
   desktop version of the site.
+- **Downloads** — Download buttons, and files a page can't show like zips,
+  save to Downloads (in the page menu and Settings) and to the Files app under
+  On My iPhone › Aura Search. A card above the bar shows progress, then Open;
+  Quick Look's Share button saves images to Photos.
 - **Reader mode** — strips a page down to the article, using Mozilla's
   Readability.js, shown with JavaScript off.
 - **Tracker blocking** — WebKit's native content blocker with a built-in list,
@@ -49,8 +60,14 @@ open AuraSearch.xcodeproj
 ```
 
 Pick an iPhone simulator and press **Run** (⌘R). To run on your own phone,
-select your Apple ID under **Signing & Capabilities** first; a free account works
-for personal testing.
+put your Apple team ID in `Config/Local.xcconfig` (bootstrap creates it):
+
+```
+DEVELOPMENT_TEAM = ABCDE12345
+```
+
+Find the ID in Xcode → Settings → Accounts. A free account works for personal
+testing. Both the app and the tests use it, and it isn't committed.
 
 Run the tests with **⌘U**.
 
@@ -59,11 +76,26 @@ The `.xcodeproj` is generated from `project.yml` and isn't committed. Edit
 
 ## Roadmap
 
-1. **Local browser** — Spaces, vertical tabs, auto-archive, reader mode, tracker blocking. ← *now*
+1. **Local browser** — Spaces, the tab deck, auto-archive, reader mode,
+   tracker blocking, downloads. ← *now*
 2. **Read Zen tabs** — sign in with a Mozilla account and see your desktop tabs.
-   Needs an OAuth client ID registered with Mozilla.
-3. **Read Zen Spaces** — group synced tabs by Space.
-4. **Two-way sync** — close or send tabs from the phone.
+   - Built on Mozilla's own Rust components from
+     [application-services](https://github.com/mozilla/application-services)
+     (`fxa-client`, `sync_manager`, `tabs`): their prebuilt XCFramework and
+     Swift bindings, vendored as a local Swift package the way Firefox for iOS
+     does it now (`rust-components-swift` is archived). No home-made sync or
+     encryption: the components decrypt records themselves.
+   - Sign-in in `ASWebAuthenticationSession`; the account state, which holds
+     the Sync keys, lives in the Keychain.
+   - Rust calls block and hit the network, so they run in a sync service off
+     the main thread, which feeds `TabStore`. Views never see the SDK.
+   - Needs an OAuth client ID with the Sync scope from Mozilla.
+3. **Read Zen Spaces** — Zen 1.22+ syncs Spaces, folders, pinned tabs and
+   Essentials through the same account, in its own `spaces` collection.
+   Mozilla's components don't read that collection, so this needs a small
+   reader for it, using the account's Sync keys.
+4. **Two-way sync** — send and close tabs from the phone, with Mozilla
+   account device commands.
 5. **Browse for Me** — on-device page summaries with Apple's Foundation Models,
    on devices that support Apple Intelligence.
 
@@ -77,6 +109,8 @@ AuraSearch/
   Views/      SwiftUI screens
   Resources/  Asset catalog, tracker list, Readability.js
 AuraSearchTests/
+design/       App icon source: edit app-icon.html, run node design/render-icon.js
+Config/       Signing (your team ID goes in Local.xcconfig)
 ```
 
 `TabStore` holds the data and knows nothing about web views, so it can be

@@ -1,13 +1,18 @@
 import SwiftUI
 
-/// A tab on screen: the page fills the screen, with a small bar below it
-/// for Tabs, New Tab and the page menu.
+/// A tab on screen. The page runs from under the status bar to the bottom
+/// of the screen, with the bar floating over its last stretch, as in Arc.
+///
+/// While moving to or from the tab screen, the live page itself shrinks
+/// into its card (or grows out of it): no copy, no crossfade.
 struct BrowserView: View {
     let tab: BrowserTab
     @Binding var readerArticle: ReaderArticle?
 
     @Environment(TabStore.self) private var store
     @Environment(BrowserSession.self) private var session
+    @Environment(\.screenMetrics) private var metrics
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var showingMenu = false
     /// Something to do once the page menu has finished closing, since a
@@ -18,27 +23,56 @@ struct BrowserView: View {
     private enum MenuFollowUp {
         case reader
         case find
+        case downloads
     }
 
     private var tint: Color {
         store.space(withID: tab.spaceID)?.color.color ?? .accentColor
     }
 
+    /// 0 while the page fills the screen, 1 once it has become its card.
+    private var cardProgress: CGFloat {
+        guard let transition = session.transition, transition.tabID == tab.id else { return 0 }
+        return transition.progress
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            if tab.isPrivate {
-                Label("Private", systemImage: "eye.slash.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
-                    .background(Color.black)
-            }
-            WebViewContainer(webView: session.webView(for: tab))
-                .overlay { loadingSnapshot }
-                .animation(.easeOut(duration: 0.25), value: session.paintedTabs.contains(tab.id))
+        let t = cardProgress
+        let page = metrics.pageRect
+        let card = session.transition.flatMap { $0.tabID == tab.id ? $0.cardRect : nil } ?? page
+        let ratio = page.width > 0 ? card.width / page.width : 1
+        let scale = 1 + (ratio - 1) * t
+        let dx = (card.minX - page.minX) * t
+        let dy = (card.minY - page.minY) * t
+        // Drawn before scaling, so it lands on the card's 22pt corners.
+        let shape = RoundedRectangle(cornerRadius: t * DeckLayout.cornerRadius / max(ratio, 0.05), style: .continuous)
+
+        ZStack(alignment: .topLeading) {
+            // Behind the status bar.
+            Color(.systemBackground)
+                .frame(width: metrics.width, height: page.minY)
+                .opacity(Double(1 - t))
+
+            // The card's shadow, cast while the page moves.
+            shape
+                .fill(Color(.systemBackground))
+                .shadow(color: .black.opacity(0.18 * Double(t)), radius: 16, x: -6, y: 6)
+                .frame(width: page.width, height: page.height)
+                .scaleEffect(scale, anchor: .topLeading)
+                .offset(x: page.minX + dx, y: page.minY + dy)
+
+            pageContent
+                .frame(width: page.width, height: page.height)
+                .clipShape(shape)
+                .scaleEffect(scale, anchor: .topLeading)
+                .offset(x: page.minX + dx, y: page.minY + dy)
+
             bottomBar
+                .opacity(Double(1 - t))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .ignoresSafeArea()
+        .allowsHitTesting(session.transition == nil)
         .tint(tint)
         .task(id: tab.id) {
             session.refreshNavigationState()
@@ -49,7 +83,8 @@ struct BrowserView: View {
             PageMenuView(
                 tab: tab,
                 onReader: { closeMenu(then: .reader) },
-                onFind: { closeMenu(then: .find) }
+                onFind: { closeMenu(then: .find) },
+                onDownloads: { closeMenu(then: .downloads) }
             )
             .environment(store)
             .environment(session)
@@ -62,6 +97,22 @@ struct BrowserView: View {
         } message: {
             Text(readerMessage ?? "")
         }
+    }
+
+    // MARK: - Page
+
+    private var pageContent: some View {
+        WebViewContainer(webView: session.webView(for: tab), bottomInset: metrics.barHeight)
+            .overlay { loadingSnapshot }
+            .overlay {
+                // A private page turns to frosted glass as it lands in the deck.
+                if tab.isPrivate {
+                    Color(white: 0.26)
+                        .opacity(0.85 * Double(cardProgress))
+                        .allowsHitTesting(false)
+                }
+            }
+            .animation(.easeOut(duration: 0.25), value: session.paintedTabs.contains(tab.id))
     }
 
     /// The tab's last snapshot, shown until a reloading page has drawn,
@@ -82,54 +133,67 @@ struct BrowserView: View {
     // MARK: - Bottom bar
 
     private var bottomBar: some View {
-        HStack {
-            circleButton("square.on.square", label: "Tabs") {
-                session.showHome()
-            }
-            Spacer()
-            Button {
-                session.presentSearch()
-            } label: {
-                Image(systemName: "plus")
-                    .font(.title2.weight(.semibold))
-                    .frame(width: 104, height: 52)
-                    .background(Color.primary.opacity(0.1), in: Capsule())
-            }
-            .accessibilityLabel("New tab")
-            Spacer()
-            circleButton("chevron.up", label: "Page menu") {
-                showingMenu = true
-            }
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 28)
-        .padding(.top, 10)
-        .padding(.bottom, 4)
-        // Charcoal on private tabs, like Arc; the system bar otherwise.
-        .browserBar(isPrivate: tab.isPrivate)
-        .overlay(alignment: .top) {
+        ZStack(alignment: .top) {
+            barBackground
+
             if session.isLoading {
-                ProgressView(value: session.progress)
-                    .progressViewStyle(.linear)
-                    .tint(tint)
+                Rectangle()
+                    .fill(tint)
+                    .frame(width: metrics.width * CGFloat(session.progress), height: 2)
+                    .frame(width: metrics.width, alignment: .leading)
+                    .animation(.linear(duration: 0.2), value: session.progress)
             }
+
+            HStack(spacing: 0) {
+                TabStackButton(images: stackImages) { session.showHome() }
+                Spacer(minLength: 0)
+                BarPlusButton { session.presentSearch() }
+                Spacer(minLength: 0)
+                BarCircleButton(systemImage: "chevron.up", label: "Page menu") { showingMenu = true }
+            }
+            .padding(.horizontal, BarMetrics.sideInset)
+            .frame(width: metrics.width, height: BarMetrics.tapSize)
+            .offset(y: metrics.barCenterY - metrics.barTop - BarMetrics.tapSize / 2)
         }
+        .frame(width: metrics.width, height: metrics.barHeight, alignment: .top)
+        // Private tabs get a dark bar with light icons, as in Arc.
+        .environment(\.colorScheme, tab.isPrivate ? .dark : colorScheme)
+        .contentShape(Rectangle())
         // Swiping up on the bar opens the menu too.
         .gesture(
             DragGesture(minimumDistance: 20).onEnded { value in
                 if value.translation.height < -30 { showingMenu = true }
             }
         )
+        .offset(y: metrics.barTop)
     }
 
-    private func circleButton(_ systemImage: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.title3.weight(.medium))
-                .frame(width: 52, height: 52)
-                .background(Color.primary.opacity(0.1), in: Circle())
+    /// The tab screen's own backdrop, cut down to the bar, so the bar and
+    /// the deck behind it read as one surface during the zoom.
+    @ViewBuilder
+    private var barBackground: some View {
+        if tab.isPrivate {
+            Color(red: 0.18, green: 0.18, blue: 0.20)
+                .frame(width: metrics.width, height: metrics.barHeight)
+        } else {
+            PastelBackground(tint: tint)
+                .frame(width: metrics.width, height: metrics.height)
+                .offset(y: -metrics.barTop)
+                .frame(width: metrics.width, height: metrics.barHeight, alignment: .top)
+                .clipped()
         }
-        .accessibilityLabel(label)
+    }
+
+    /// The previous tab, then this one, for the tabs button.
+    private var stackImages: [UIImage] {
+        let previous = store.tabs(in: tab.spaceID)
+            .filter { $0.id != tab.id }
+            .max { $0.lastActiveAt < $1.lastActiveAt }
+        return [previous.flatMap { thumbnail(for: $0) }, thumbnail(for: tab)].compactMap { $0 }
+    }
+
+    private func thumbnail(for tab: BrowserTab) -> UIImage? {
+        tab.isPrivate ? session.snapshots.cardPreviews[tab.id] : session.snapshots.images[tab.id]
     }
 
     // MARK: - Menu follow-ups
@@ -147,6 +211,8 @@ struct BrowserView: View {
             session.presentFindOnPage()
         case .reader:
             Task { await openReader() }
+        case .downloads:
+            session.downloads.isListPresented = true
         }
     }
 

@@ -49,12 +49,14 @@ final class TabStore {
             ? state.selectedSpaceID
             : state.spaces[0].id
 
-        // Reopen the last tab you were on, unless it's old enough to be archived.
+        // Reopen the last tab you were on (or, if it was closed, the most
+        // recent one), unless it's old enough to be archived. Like Arc, the
+        // app opens on a page, not the tab screen.
+        let fresh = state.tabs.filter { !Self.isStale($0, settings: state.settings, now: .now) }
+        let lastViewed = state.lastViewedTabID.flatMap { id in fresh.first { $0.id == id } }
         var restored: UUID?
-        if let lastID = state.lastViewedTabID,
-           let tab = state.tabs.first(where: { $0.id == lastID }),
-           !Self.isStale(tab, settings: state.settings, now: .now) {
-            restored = lastID
+        if let tab = lastViewed ?? fresh.max(by: { $0.lastActiveAt < $1.lastActiveAt }) {
+            restored = tab.id
             selected = tab.spaceID
         }
 
@@ -159,6 +161,16 @@ final class TabStore {
     /// Closes a tab and keeps it in the archive.
     func closeTab(_ id: UUID) {
         closeTabs([id], reason: .closed)
+    }
+
+    /// Removes a tab without archiving it: one that only started a download,
+    /// so there's no page to restore.
+    func discardTab(_ id: UUID) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        tabs.removeAll { $0.id == id }
+        if activeTabID == id { activeTabID = nil }
+        if lastViewedTabID == id { lastViewedTabID = nil }
+        persist()
     }
 
     /// Closes every unpinned tab in a Space. Returns the closed tab IDs.

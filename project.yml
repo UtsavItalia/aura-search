@@ -7,13 +7,16 @@ options:
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
+# Signing for every target. Your team ID goes in Config/Local.xcconfig.
+configFiles:
+  Debug: Config/Signing.xcconfig
+  Release: Config/Signing.xcconfig
 settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
-    DEVELOPMENT_TEAM: ""                 # set your team in Xcode > Signing & Capabilities
 targets:
   AuraSearch:
     type: application
@@ -37,6 +40,16 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         ITSAppUsesNonExemptEncryption: false
+        # Downloads go to Documents/Downloads, shown in the Files app under
+        # On My iPhone > Aura Search.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        # Web features iOS asks permission for. Without these the app crashes
+        # when a page uses them (Save to Photos, a photo upload's camera...).
+        NSPhotoLibraryAddUsageDescription: Saves images you choose to your photo library.
+        NSCameraUsageDescription: Lets websites you allow use the camera, like for a video call or a photo upload.
+        NSMicrophoneUsageDescription: Lets websites you allow use the microphone, like for a video call.
+        NSLocationWhenInUseUsageDescription: Lets websites you allow see your location, like maps.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.aurasearch.app

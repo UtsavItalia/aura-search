@@ -18,6 +18,12 @@ if [ ! -f "$READABILITY_PATH" ]; then
     "https://raw.githubusercontent.com/mozilla/readability/${READABILITY_VERSION}/Readability.js"
 fi
 
+LOCAL_SIGNING="Config/Local.xcconfig"
+if [ ! -f "$LOCAL_SIGNING" ]; then
+  printf '// Your own signing settings. Not committed (see .gitignore).\nDEVELOPMENT_TEAM =\n' > "$LOCAL_SIGNING"
+  echo "Created $LOCAL_SIGNING. Add your Apple team ID there to run on a phone."
+fi
+
 xcodegen generate
 echo
 echo "Done. Open AuraSearch.xcodeproj in Xcode and press Run."

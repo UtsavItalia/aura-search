@@ -4,15 +4,29 @@ import SwiftUI
 /// Icons come straight from the site you visited, never a third-party
 /// favicon service, so nothing about your tabs leaks elsewhere.
 struct FaviconView: View {
-    let tab: BrowserTab
+    let url: URL?
+    let title: String
     let tint: Color
     /// `.tile` sits the icon on a tinted square, for lists. `.plain` is the
-    /// bare icon, for the small header above a tab card.
+    /// bare icon. `.badge` puts it on a small white disc, as above Arc's
+    /// tab cards.
     var style: Style = .tile
+
+    init(url: URL?, title: String, tint: Color, style: Style = .tile) {
+        self.url = url
+        self.title = title
+        self.tint = tint
+        self.style = style
+    }
+
+    init(tab: BrowserTab, tint: Color, style: Style = .tile) {
+        self.init(url: tab.url, title: tab.displayTitle, tint: tint, style: style)
+    }
 
     enum Style {
         case tile
         case plain
+        case badge
     }
 
     var body: some View {
@@ -29,6 +43,14 @@ struct FaviconView: View {
             icon(size: 18, letterFont: .caption2.weight(.bold))
                 .frame(width: 18, height: 18)
                 .accessibilityHidden(true)
+        case .badge:
+            ZStack {
+                Circle().fill(Color.white)
+                icon(size: 13, letterFont: .system(size: 10, weight: .bold))
+            }
+            .frame(width: 20, height: 20)
+            .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
+            .accessibilityHidden(true)
         }
     }
 
@@ -53,10 +75,10 @@ struct FaviconView: View {
 
     @ViewBuilder
     private func letter(font: Font) -> some View {
-        let text = Text(String(tab.displayTitle.prefix(1)).uppercased())
+        let text = Text(String(title.prefix(1)).uppercased())
             .font(font)
         switch style {
-        case .tile:
+        case .tile, .badge:
             text.foregroundStyle(tint)
         case .plain:
             // A small tinted disc, so it reads as an icon at this size.
@@ -68,7 +90,7 @@ struct FaviconView: View {
     }
 
     private var faviconURL: URL? {
-        guard let url = tab.url,
+        guard let url,
               let scheme = url.scheme,
               ["http", "https"].contains(scheme),
               let host = url.host() else { return nil }

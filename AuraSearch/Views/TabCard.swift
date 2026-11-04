@@ -11,20 +11,23 @@ struct TabCard: View {
     let snapshot: UIImage?
     /// The tiny blurred version, for private tabs, whose pages stay hidden.
     let blurredPreview: UIImage?
-    /// Set by the deck: the title shows only on the current card, and the
-    /// icons of cards deep in the stack fade out.
+    /// Set by the deck: cards behind the front one are darker, the title
+    /// shows only on the front card, and icons deep in the stack fade out.
+    var dim: Double = 0
     var titleOpacity: Double = 1
     var iconOpacity: Double = 1
+    /// Hidden while the live page is moving into (or out of) this card,
+    /// since the page itself is drawn there.
+    var previewHidden = false
     let onOpen: () -> Void
-    let onClose: () -> Void
+    /// Called the moment a swipe up commits, with how far up the card was
+    /// dragged, so the deck can send it flying from exactly there.
+    let onClose: (_ dragOffset: CGFloat) -> Void
     let onTogglePin: () -> Void
 
     /// Live drag, locked to one axis once it starts. Springs back on release.
     @GestureState(resetTransaction: Transaction(animation: .spring(response: 0.35, dampingFraction: 0.8)))
     private var drag = CardDrag()
-    /// Set when a close is committed, to fly the card off the top.
-    @State private var flyAwayOffset: CGFloat = 0
-    @State private var closeFeedback = 0
     @State private var pinFeedback = 0
 
     /// How far up a card must go to close, and how far down to pin.
@@ -42,9 +45,10 @@ struct TabCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: DeckLayout.headerSpacing) {
             header
             previewCard
+                .opacity(previewHidden ? 0 : 1)
         }
         .overlay(alignment: .top) { pinHint }
         .offset(y: offsetY)
@@ -53,30 +57,29 @@ struct TabCard: View {
         .contentShape(Rectangle())
         .onTapGesture { onOpen() }
         .simultaneousGesture(dragGesture)
-        .sensoryFeedback(.impact(weight: .medium), trigger: closeFeedback)
         .sensoryFeedback(.selection, trigger: pinFeedback)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("Swipe up to close, pull down to pin")
-        .accessibilityAction(named: Text("Close tab")) { onClose() }
+        .accessibilityAction(named: Text("Close tab")) { onClose(0) }
         .accessibilityAction(named: Text(tab.isPinned ? "Unpin tab" : "Pin tab")) { onTogglePin() }
     }
 
     // MARK: - Parts
 
 
-    /// Small, like Arc's: the bare site icon and the title in small grey
-    /// text, sitting just above the card and lined up with its content.
-    /// The title shows only on the current card; icons always show.
+    /// Like Arc's: the site icon on a small white disc and the title in
+    /// small type, sitting just above the card and in from its edge.
+    /// The title shows only on the front card; icons always show.
     private var header: some View {
         HStack(spacing: 8) {
-            FaviconView(tab: tab, tint: tint, style: .plain)
+            FaviconView(tab: tab, tint: tint, style: .badge)
                 .opacity(iconOpacity)
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 4) {
                     Text(tab.displayTitle)
                         .font(.footnote.weight(.medium))
-                        .foregroundStyle(Color.primary.opacity(0.8))
+                        .foregroundStyle(Color.primary.opacity(0.85))
                         .lineLimit(1)
                     if tab.isPinned {
                         Image(systemName: "pin.fill")
@@ -94,12 +97,13 @@ struct TabCard: View {
             .opacity(titleOpacity)
             Spacer(minLength: 0)
         }
-        .frame(height: 30, alignment: .bottom)
-        .padding(.horizontal, 16)
+        .frame(height: DeckLayout.headerHeight, alignment: .bottom)
+        .padding(.leading, 17.5)
+        .padding(.trailing, 8)
     }
 
     private var previewCard: some View {
-        let shape = RoundedRectangle(cornerRadius: 30, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: DeckLayout.cornerRadius, style: .continuous)
         return Group {
             if tab.isPrivate {
                 frostedPreview
@@ -107,6 +111,8 @@ struct TabCard: View {
                 pagePreview
             }
         }
+        // Cards stacked behind the front one darken, as in Arc.
+        .overlay { Color.black.opacity(dim) }
         .clipShape(shape)
         .overlay(
             shape.strokeBorder(
@@ -186,7 +192,6 @@ struct TabCard: View {
     // MARK: - Drag
 
     private var offsetY: CGFloat {
-        if flyAwayOffset != 0 { return flyAwayOffset }
         guard drag.axis == .vertical else { return 0 }
         // Up follows the finger; down resists, since it's a pull, not a move.
         return drag.dy < 0 ? drag.dy : min(drag.dy * 0.45, 70)
@@ -197,8 +202,7 @@ struct TabCard: View {
     }
 
     private var cardOpacity: Double {
-        if flyAwayOffset != 0 { return 0 }
-        return 1 - min(Double(max(-offsetY, 0)) / 600, 0.5)
+        1 - min(Double(max(-offsetY, 0)) / 600, 0.5)
     }
 
     private var dragGesture: some Gesture {
@@ -217,22 +221,11 @@ struct TabCard: View {
                 guard abs(dy) > abs(value.translation.width) else { return }
                 let flungUp = value.predictedEndTranslation.height < -Self.closeDistance * 2.5
                 if dy < -Self.closeDistance || (dy < -30 && flungUp) {
-                    close()
+                    onClose(dy)
                 } else if dy > Self.pinDistance {
                     pinFeedback += 1
                     onTogglePin()
                 }
             }
-    }
-
-    private func close() {
-        closeFeedback += 1
-        withAnimation(.easeIn(duration: 0.2)) {
-            flyAwayOffset = -900
-        }
-        Task {
-            try? await Task.sleep(for: .milliseconds(200))
-            onClose()
-        }
     }
 }

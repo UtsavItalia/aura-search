@@ -2,6 +2,8 @@
 *.xcodeproj/
 # Fetched by scripts/bootstrap.sh
 AuraSearch/Resources/Readability.js
+# Your own signing team (see Config/Signing.xcconfig)
+Config/Local.xcconfig
 
 # Xcode
 build/

@@ -1,0 +1,48 @@
+<!doctype html>
+<!--
+  Aura Search app icon source. Each #id below is one 1024x1024 icon:
+    #halo     -> AppIcon.png         (light, the default)
+    #eclipse2 -> AppIcon-Dark.png    (dark mode)
+    #tinted   -> AppIcon-Tinted.png  (tinted home screens; saved as grayscale)
+  Render with any Chromium, e.g. Playwright:
+    node design/render-icon.js
+  then copy the PNGs into AuraSearch/Resources/Assets.xcassets/AppIcon.appiconset/.
+-->
+<html><head><meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: #000; }
+  .icon { width: 1024px; height: 1024px; position: relative; overflow: hidden; }
+  .icon > div { position: absolute; }
+  .c { left: 50%; top: 50%; transform: translate(-50%, -50%); border-radius: 50%; }
+  /* The light: shared by all three */
+  .wide  { width: 880px; height: 880px; filter: blur(130px); }
+  .corona { width: 600px; height: 600px; filter: blur(36px); }
+  .rim { width: 498px; height: 498px; left: 53.2%; top: 53.2%; filter: blur(5px); }
+  .disc { width: 480px; height: 480px; left: 54.6%; top: 54.6%; }
+  .spectrum { background: conic-gradient(from 200deg, #FF9A6B, #FF5E8A, #A66CFF, #6FA0FF, #FF9A6B); }
+  .spectrum-bright { background: conic-gradient(from 200deg, #FFD3B6, #FF7EA3, #C9A0FF, #A5C8FF, #FFD3B6); }
+
+  /* Eclipse (night) */
+  .eclipse .bg { inset: 0; background: radial-gradient(circle at 50% 44%, #2A1F3D 0%, #150F21 58%, #0B0812 100%); }
+  .eclipse .wide { opacity: .42; }
+  .eclipse .disc { background: radial-gradient(circle at 36% 32%, #2C2244 0%, #161023 60%, #100B1A 100%); }
+
+  /* Halo (day) */
+  .halo .bg { inset: 0; background: radial-gradient(circle at 50% 42%, #FFFCF8 0%, #F9F0E6 55%, #F1E3D4 100%); }
+  .halo .wide { opacity: .5; }
+  .halo .corona { opacity: .95; }
+  .halo .disc { background: radial-gradient(circle at 38% 34%, #FFFFFF 0%, #FFFAF4 60%, #F8EEE3 100%);
+    box-shadow: inset 10px 12px 30px rgba(255,255,255,.8); }
+
+  /* Tinted: grayscale light on black, which iOS colors with the user's tint */
+  .tinted .bg { inset: 0; background: #000; }
+  .tinted .wide { opacity: .5; filter: blur(130px) grayscale(1) brightness(1.25); }
+  .tinted .corona { filter: blur(36px) grayscale(1) brightness(1.25); }
+  .tinted .rim { filter: blur(5px) grayscale(1) brightness(1.3); }
+  .tinted .disc { background: #000; }
+</style></head>
+<body>
+  <div id="eclipse2" class="icon eclipse"><div class="bg"></div><div class="wide c spectrum"></div><div class="corona c spectrum"></div><div class="rim c spectrum-bright"></div><div class="disc c"></div></div>
+  <div id="halo" class="icon halo"><div class="bg"></div><div class="wide c spectrum"></div><div class="corona c spectrum"></div><div class="rim c spectrum-bright"></div><div class="disc c"></div></div>
+  <div id="tinted" class="icon tinted"><div class="bg"></div><div class="wide c spectrum"></div><div class="corona c spectrum"></div><div class="rim c spectrum-bright"></div><div class="disc c"></div></div>
+</body></html>

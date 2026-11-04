@@ -509,14 +509,20 @@ enum SummaryText {
         var outline = SummaryOutline()
         for rawLine in summary.components(separatedBy: .newlines) {
             var line = rawLine.replacingOccurrences(of: "**", with: "")
+                .replacingOccurrences(of: "\u{00A0}", with: " ")
                 .trimmingCharacters(in: .whitespaces)
             while line.hasPrefix("#") { line.removeFirst() }
             line = line.trimmingCharacters(in: .whitespaces)
             // Skip empty lines, and a bullet that has only its marker so far.
             guard !line.isEmpty, !bulletMarkers.contains(line) else { continue }
 
-            if let body = bulletBody(of: line) {
-                if !body.isEmpty { outline.bullets.append(body) }
+            if var body = bulletBody(of: line) {
+                // The model sometimes doubles the marker ("• - point"). Only
+                // symbols are stripped again, so "2024. …" keeps its year.
+                while let marker = bulletMarkers.first(where: { body.hasPrefix($0 + " ") }) {
+                    body = String(body.dropFirst(marker.count + 1)).trimmingCharacters(in: .whitespaces)
+                }
+                if !body.isEmpty && !bulletMarkers.contains(body) { outline.bullets.append(body) }
             } else if outline.bullets.isEmpty {
                 outline.headline = outline.headline.isEmpty ? line : outline.headline + " " + line
             } else {

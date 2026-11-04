@@ -43,6 +43,11 @@ final class SummaryTextTests: XCTestCase {
         ])
     }
 
+    func testDoubledBulletMarkersAreRemoved() {
+        let outline = SummaryText.parse("Rain is coming.\n- - Take a coat\n• - Roads may flood\n- 2024. A wet year")
+        XCTAssertEqual(outline.bullets, ["Take a coat", "Roads may flood", "2024. A wet year"])
+    }
+
     func testHalfWrittenBulletIsntShownYet() {
         let outline = SummaryText.parse("Summary: Rain is coming.\n-")
         XCTAssertEqual(outline.headline, "Rain is coming.")

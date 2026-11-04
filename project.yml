@@ -50,6 +50,12 @@ targets:
         NSCameraUsageDescription: Lets websites you allow use the camera, like for a video call or a photo upload.
         NSMicrophoneUsageDescription: Lets websites you allow use the microphone, like for a video call.
         NSLocationWhenInUseUsageDescription: Lets websites you allow see your location, like maps.
+    dependencies:
+      # Apple's on-device model, for Summarize. Weak, so the app still opens
+      # on iOS 17-25, where the framework doesn't exist.
+      - sdk: FoundationModels.framework
+        weak: true
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.aurasearch.app

@@ -14,6 +14,17 @@ private struct ReadabilityPayload: Decodable {
     let content: String
 }
 
+/// A page's title and plain text, for summarizing.
+struct PageText {
+    let title: String
+    let text: String
+}
+
+private struct PageTextPayload: Decodable {
+    let title: String
+    let text: String
+}
+
 /// Reader mode, using Mozilla's Readability.js (the library behind
 /// Firefox's reader view). It runs in an isolated JavaScript world, so the
 /// page's own scripts can't see or tamper with it.
@@ -72,6 +83,44 @@ enum ReaderMode {
             sourceURL: webView.url
         )
     }
+
+    /// The page's readable text, for summarizing: the article Readability
+    /// finds, or else all the text on the page (search results, forums...).
+    static func pageText(from webView: WKWebView) async -> PageText {
+        let script = (readabilitySource.map { $0 + "\n" } ?? "") + textScript
+        let json: String = await withCheckedContinuation { continuation in
+            webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { result in
+                switch result {
+                case .success(let value):
+                    continuation.resume(returning: value as? String ?? "")
+                case .failure:
+                    continuation.resume(returning: "")
+                }
+            }
+        }
+        let fallbackTitle = webView.title ?? ""
+        guard let data = json.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(PageTextPayload.self, from: data) else {
+            return PageText(title: fallbackTitle, text: "")
+        }
+        return PageText(title: payload.title.isEmpty ? fallbackTitle : payload.title, text: payload.text)
+    }
+
+    private static let textScript = """
+    ;(function () {
+      var title = document.title || "";
+      try {
+        if (typeof Readability !== "undefined") {
+          var article = new Readability(document.cloneNode(true)).parse();
+          if (article && article.textContent && article.textContent.trim().length > 400) {
+            return JSON.stringify({ title: article.title || title, text: article.textContent.slice(0, 300000) });
+          }
+        }
+      } catch (e) {}
+      var text = document.body ? document.body.innerText : "";
+      return JSON.stringify({ title: title, text: (text || "").slice(0, 300000) });
+    })();
+    """
 
     /// The reader page. Shown with JavaScript off and a strict content
     /// security policy, so only text, images and media get through.

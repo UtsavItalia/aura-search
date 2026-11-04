@@ -23,6 +23,7 @@ struct BrowserView: View {
     private enum MenuFollowUp {
         case reader
         case find
+        case summarize
         case downloads
     }
 
@@ -84,10 +85,16 @@ struct BrowserView: View {
                 tab: tab,
                 onReader: { closeMenu(then: .reader) },
                 onFind: { closeMenu(then: .find) },
+                onSummarize: { closeMenu(then: .summarize) },
                 onDownloads: { closeMenu(then: .downloads) }
             )
             .environment(store)
             .environment(session)
+        }
+        .sheet(isPresented: showingSummary) {
+            SummaryView(tab: tab)
+                .environment(store)
+                .environment(session)
         }
         .alert(
             "Reader Mode",
@@ -211,9 +218,19 @@ struct BrowserView: View {
             session.presentFindOnPage()
         case .reader:
             Task { await openReader() }
+        case .summarize:
+            session.requestSummary(for: tab.id)
         case .downloads:
             session.downloads.isListPresented = true
         }
+    }
+
+    /// Up while this tab's summary is open, from the menu or a pinch.
+    private var showingSummary: Binding<Bool> {
+        Binding(
+            get: { session.summaryTabID == tab.id },
+            set: { if !$0 { session.summaryTabID = nil } }
+        )
     }
 
     private func openReader() async {

@@ -38,6 +38,10 @@ the phone companion for Zen Browser on desktop.
   save to Downloads (in the page menu and Settings) and to the Files app under
   On My iPhone › Aura Search. A card above the bar shows progress, then Open;
   Quick Look's Share button saves images to Photos.
+- **Summarize** — pinch a page in past its smallest zoom, or tap Summarize in
+  the page menu, for a short summary written on the iPhone by Apple
+  Intelligence (iOS 26 or later, on iPhones that support it). Long pages are
+  read in parts. Nothing about the page leaves the device.
 - **Reader mode** — strips a page down to the article, using Mozilla's
   Readability.js, shown with JavaScript off.
 - **Tracker blocking** — WebKit's native content blocker with a built-in list,
@@ -96,8 +100,9 @@ The `.xcodeproj` is generated from `project.yml` and isn't committed. Edit
    reader for it, using the account's Sync keys.
 4. **Two-way sync** — send and close tabs from the phone, with Mozilla
    account device commands.
-5. **Browse for Me** — on-device page summaries with Apple's Foundation Models,
-   on devices that support Apple Intelligence.
+5. **Browse for Me** — on-device answers from several pages with Apple's
+   Foundation Models, on devices that support Apple Intelligence. Its first
+   piece, summarizing one page, shipped early in phase 1.
 
 ## How the code is organized
 

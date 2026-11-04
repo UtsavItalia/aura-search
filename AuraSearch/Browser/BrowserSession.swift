@@ -34,6 +34,8 @@ final class BrowserSession {
     private(set) var isSearchClosing = false
     /// Whether searches from the search sheet open private tabs.
     var prefersPrivateTabs = false
+    /// The tab whose summary sheet is up, if any.
+    var summaryTabID: UUID?
 
     let store: TabStore
     /// Page previews for the home screen's tab cards.
@@ -55,6 +57,9 @@ final class BrowserSession {
     @ObservationIgnored private var observations: [UUID: [NSKeyValueObservation]] = [:]
     /// Back/forward history of web views dropped to save memory.
     @ObservationIgnored private var savedStates: [UUID: Any] = [:]
+    /// Pinch to summarize, one per live web view. Gesture recognizers don't
+    /// keep their targets alive, so they're kept here.
+    @ObservationIgnored private var pinchHandlers: [UUID: PinchToSummarize] = [:]
     @ObservationIgnored private var hasHandledLaunch = false
     /// The tab each new tab was opened from, for going back to it if the
     /// new tab turns out to be only a download.
@@ -112,6 +117,10 @@ final class BrowserSession {
         webView.navigationDelegate = delegate
         webView.uiDelegate = delegate
         applyContentBlocking(to: webView, host: tab.url?.host())
+        let tabID = tab.id
+        pinchHandlers[tabID] = PinchToSummarize(webView: webView) { [weak self] in
+            self?.requestSummary(for: tabID) ?? false
+        }
 
         webViews[tab.id] = webView
         observe(webView, tabID: tab.id)
@@ -159,6 +168,7 @@ final class BrowserSession {
 
     private func discardWebView(_ id: UUID, deferringObservedChanges: Bool = false) {
         observations[id] = nil // invalidates the KVO observations
+        pinchHandlers[id] = nil
         if let webView = webViews.removeValue(forKey: id) {
             webView.stopLoading()
             webView.navigationDelegate = nil
@@ -180,6 +190,7 @@ final class BrowserSession {
     private func forget(_ id: UUID) {
         savedStates[id] = nil
         openers[id] = nil
+        if summaryTabID == id { summaryTabID = nil }
         desktopSiteTabs.remove(id)
         snapshots.remove(id)
         discardWebView(id)
@@ -321,6 +332,18 @@ final class BrowserSession {
             }
             self.refreshNavigationState()
         }
+    }
+
+    /// Opens the summary sheet for the tab on screen: from the page menu, or
+    /// by pinching the page in past its smallest zoom. Returns whether it opened.
+    @discardableResult
+    func requestSummary(for tabID: UUID) -> Bool {
+        guard PageSummarizer.isOffered,
+              store.activeTabID == tabID,
+              transition == nil,
+              !isSearchPresented else { return false }
+        summaryTabID = tabID
+        return true
     }
 
     /// Opens a tab straight away, with no zoom: from search, history and

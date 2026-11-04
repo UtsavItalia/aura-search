@@ -6,6 +6,7 @@ struct PageMenuView: View {
     let tab: BrowserTab
     let onReader: () -> Void
     let onFind: () -> Void
+    let onSummarize: () -> Void
     let onDownloads: () -> Void
 
     @Environment(TabStore.self) private var store
@@ -152,6 +153,11 @@ struct PageMenuView: View {
             }
             tile("Reader", systemImage: "doc.plaintext", enabled: tab.url != nil) {
                 onReader()
+            }
+            if PageSummarizer.isOffered {
+                tile("Summarize", systemImage: "sparkles", enabled: tab.url != nil) {
+                    onSummarize()
+                }
             }
             tile(tab.isPinned ? "Unpin" : "Pin", systemImage: tab.isPinned ? "pin.slash" : "pin", enabled: true) {
                 store.togglePin(tab.id)

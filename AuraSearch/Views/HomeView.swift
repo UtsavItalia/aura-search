@@ -281,6 +281,9 @@ private struct TabCarousel: View {
         var start: CGPoint?
         var startPosition: CGFloat = 0
         var isHorizontal: Bool?
+        /// How far the finger had gone when the drag was recognised. The
+        /// deck follows from there, so it doesn't jump by the threshold.
+        var slop: CGFloat = 0
     }
 
     init(tabs: [BrowserTab], tint: Color, initialPosition: CGFloat) {
@@ -540,19 +543,20 @@ private struct TabCarousel: View {
                 if drag.isHorizontal == nil {
                     let isHorizontal = abs(value.translation.width) > abs(value.translation.height)
                     drag.isHorizontal = isHorizontal
+                    drag.slop = value.translation.width
                     // A sideways drag catches the deck wherever it is, even
                     // mid-glide. A card being swiped up or down leaves the
                     // glide to finish, so the deck still comes to rest.
                     if isHorizontal { glide.stop() }
                 }
                 guard drag.isHorizontal == true else { return }
-                position = rubberBanded(drag.startPosition - value.translation.width / dragStep)
+                position = rubberBanded(drag.startPosition - (value.translation.width - drag.slop) / dragStep)
             }
             .onEnded { value in
                 defer { drag = DeckDrag() }
                 guard drag.isHorizontal == true else { return }
                 // Where a flick would carry the deck, at most two cards away.
-                let projected = drag.startPosition - value.predictedEndTranslation.width / dragStep
+                let projected = drag.startPosition - (value.predictedEndTranslation.width - drag.slop) / dragStep
                 let target = DeckLayout.nearestRest(to: projected, from: drag.startPosition, count: tabs.count)
                 // The finger's speed in cards per second, so the glide
                 // carries straight on from the flick.

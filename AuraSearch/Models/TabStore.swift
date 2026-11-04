@@ -89,15 +89,27 @@ final class TabStore {
         spaces.first { $0.id == id }
     }
 
-    /// Tabs in a Space, in carousel order: pinned first, then oldest to
-    /// newest, so a new tab joins the end of the deck like Arc Search.
+    /// Tabs in a Space, in carousel order: pinned first, then in the order
+    /// they're kept, which puts the most recently used at the end of the
+    /// deck. A new tab joins the end, and so does a tab you leave (see
+    /// `moveToFront`), like Arc Search.
     func tabs(in spaceID: UUID) -> [BrowserTab] {
-        tabs
-            .filter { $0.spaceID == spaceID }
+        // Enumerated so ties keep their stored order (a plain sort needn't).
+        tabs.enumerated()
+            .filter { $0.element.spaceID == spaceID }
             .sorted { lhs, rhs in
-                if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
-                return lhs.createdAt < rhs.createdAt
+                if lhs.element.isPinned != rhs.element.isPinned { return lhs.element.isPinned }
+                return lhs.offset < rhs.offset
             }
+            .map(\.element)
+    }
+
+    /// Puts a tab at the front of its deck (the end, where the newest
+    /// cards are), as Arc Search does with the tab you were just on.
+    func moveToFront(_ id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }), index != tabs.count - 1 else { return }
+        tabs.append(tabs.remove(at: index))
+        persist()
     }
 
     // MARK: - Tabs

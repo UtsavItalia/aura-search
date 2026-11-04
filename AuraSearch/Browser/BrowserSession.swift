@@ -417,6 +417,10 @@ final class BrowserSession {
         }
         let id = tab.id
         let webView = webViews[id]
+        // The tab you leave becomes the front card, so the deck you land on
+        // is ordered by use, like Arc's. Done before the deck is drawn, so
+        // no card is seen changing places.
+        store.moveToFront(id)
         // The card needs a fresh picture of the page. Taken now, while the
         // page is still on screen, alongside the animation rather than before it.
         let capture: Task<Void, Never>? = webView.map { webView in
@@ -481,6 +485,7 @@ final class BrowserSession {
             cardRect: cardRect,
             deckPosition: deckPosition
         )
+        coverUntilRedrawn(id)
         store.activate(id)
         refreshNavigationState()
         Task {
@@ -620,6 +625,44 @@ final class BrowserSession {
         pictureTasks[id] = nil
         leavingPictures[id] = nil
         if coveredTabs.contains(id) { pageDidPaint(id) }
+    }
+
+    /// A web view kept alive off screen has let go of its drawing, and for
+    /// the first few frames back on screen WebKit shows it blank white
+    /// (about 100 ms, seen as a white card growing into the page). The
+    /// card's picture covers it until the page has drawn twice in the
+    /// window, then fades out as usual. Web views being rebuilt already
+    /// wait for their first paint, so they're left alone.
+    private func coverUntilRedrawn(_ id: UUID) {
+        guard let webView = webViews[id],
+              paintedTabs.contains(id),
+              snapshots.images[id] != nil else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            coveredTabs.insert(id)
+            paintedTabs.remove(id)
+        }
+        coverTimeouts[id]?.cancel()
+        coverTimeouts[id] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            self?.pageDidPaint(id)
+        }
+        Task { [weak self, weak webView] in
+            // Animation frames only run once the page is drawing in the
+            // window again, so two of them mean it's back on screen.
+            // If the script can't run (no JavaScript on the page), the
+            // timeout lifts the cover instead.
+            do {
+                _ = try await webView?.callAsyncJavaScript(
+                    "await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))",
+                    contentWorld: .defaultClient
+                )
+            } catch { return }
+            guard let self, self.coveredTabs.contains(id) else { return }
+            self.pageDidPaint(id)
+        }
     }
 
     /// The page's script reported that it has drawn its first frames.

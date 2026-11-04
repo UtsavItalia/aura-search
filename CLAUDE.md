@@ -60,11 +60,14 @@ Aura Search is a free, open-source (MIT) iPhone browser that recreates Arc Searc
 - `TabCarousel` stays alive with no tabs, so the last card's copy finishes flying; the empty state fades in underneath it.
 - Card shadows are cast by a plain shape behind each card; the dim overlay sits on top. Keeps shadows from re-rendering every frame.
 - Card titles are masked (not narrowed) at the next card's left edge (`headerVisibleWidth`), so titles never overlap and text isn't re-laid-out per frame.
+- Deck order is by use, like Arc: `TabStore.tabs(in:)` keeps stored order (pinned first), and `BrowserSession.showHome` calls `TabStore.moveToFront` on the tab being left *before* the deck draws, so it lands as the front (rightmost) card and no card is seen changing places. New tabs append, so they start at the front too.
+- The deck drag subtracts its 12 pt recognition distance (`DeckDrag.slop`), so the deck doesn't jump on the drag's first frame.
 
 ### Page transitions
 - New tab from search or a new-window link: `BrowserSession.arrival` grows the page in from 94% with rounded corners over the deck's pastel (`Motion.arrive`).
 - Link taps crossfade: `navigationStarting` (link/form/other, not back/forward or reload) snapshots the page; at `didCommit` the picture goes up instantly (`pageCovers`, animations disabled); it fades out (`Motion.crossfade`) when the page reports it has drawn — a script in the `.defaultClient` world posts `auraPageReady` after DOMContentLoaded + 2 animation frames (`PageReadyHandler`, weak to the session) — or after 1.2 s, or on finish/failure. Cancelled navigations (NSURLErrorCancelled) are ignored.
 - Until a page first draws, a cover hides WebKit's blank white: the leaving page's picture, else the last snapshot, else plain `systemBackground`. It appears instantly and only fades out.
+- Opening a card whose web view is still alive: WebKit drops an off-screen web view's drawing and shows white for ~100 ms when it returns. `coverUntilRedrawn` holds the card's snapshot over the page (covered, not painted) until two animation frames have run in the window (`callAsyncJavaScript` in `.defaultClient`), with a 600 ms timeout. Evicted web views being rebuilt already wait for their first paint.
 
 ### Fixed elements and the bottom bar
 - WebKit ignores `scrollView.contentInset` when placing `position: fixed` elements, so bottom-fixed banners (cookie consent buttons) hid behind our bar. iOS 26+: `webView.obscuredContentInsets.bottom = barHeight` (public API, what Safari's toolbars use) plus the scroll inset. iOS 17–25: the web view's frame ends at the bar instead (no public API there). Card previews are width-fitted so the shorter pre-26 snapshots aren't cropped.
@@ -87,7 +90,8 @@ Aura Search is a free, open-source (MIT) iPhone browser that recreates Arc Searc
 - Weak link of FoundationModels; name-based model error classification.
 - `Motion.swift` as the single source of animation values; `CADisableMinimumFrameDurationOnPhone`.
 - `DeckGlide` + `DeckReflow` + `FrameTicker` (frame-driven deck motion), the opaque velocity fling and its z-order, shadow-behind/dim-on-top card layering, and the title mask.
-- Page covers + `PageReadyHandler` crossfade flow; insert covers with animations disabled; never mark a covered tab painted from load progress.
+- Page covers + `PageReadyHandler` crossfade flow (and `coverUntilRedrawn` when a card opens); insert covers with animations disabled; never mark a covered tab painted from load progress.
+- Deck order by use (`moveToFront` in `showHome`, before the deck draws).
 - `obscuredContentInsets` on iOS 26+ / shortened web view frame before 26.
 - `.gitignore` entries for `*.xcodeproj/`, `Readability.js`, `Config/Local.xcconfig`.
 
@@ -96,16 +100,14 @@ Aura Search is a free, open-source (MIT) iPhone browser that recreates Arc Searc
 ### Done on `main` (pushed)
 Phase 1 local browser: Spaces, Arc-style deck and page zoom, swipe-to-close/pull-to-pin, auto-archive + Archive, history with autocomplete, search suggestions, private tabs, reader mode, tracker blocking with per-site exceptions, app links, page menu (address, back/forward, copy link, find, reader, summarize, pin, share, zoom, desktop site, move to Space), downloads (card + list + Quick Look), app icon set, signing fix.
 Summarize Page (confirmed on device) and the doubled-bullet fix (`770b98c`).
+Motion polish (`0225244`, confirmed on device): 120 fps opt-in, cheaper card rendering + title mask, deck glide/fling/reflow, app-wide `Motion` rules, new pages grow in, link crossfade, no blank-white flash before first paint, fixed bottom elements above the bar.
+Deck polish from the 2026-11-04 Arc vs Aura recordings (confirmed on device): deck ordered by use, no white flash when reopening a live tab, deck drag without the threshold jump.
 
-### On branch `motion-polish` (pushed; the Mac is on this branch) — needs testing on the phone
-Built from the owner's screen recording (42 s at 120 fps; the deck only ever drew 60 fps):
-1. 120 fps opt-in; cheaper card rendering (shadow/dim layering); title mask so cards' titles don't overlap.
-2. Deck glide that starts at the flick's speed and can be caught mid-glide.
-3. Swipe-to-close like the app switcher (opaque, velocity fling, smooth reflow).
-4. App-wide `Motion` rules; every animation now uses them.
-5. New pages grow in; link taps crossfade instead of blinking; no blank-white flash before first paint.
-6. Cookie banners/fixed bottom elements no longer hide behind the bottom bar (iOS 26+ `obscuredContentInsets`).
-**Next**: owner builds (`xcodegen generate` — new file `Views/Motion.swift` + Info.plist key), tests on the phone, then merge `motion-polish` into `main`. Things to watch: deck smoothness at 120 Hz, the link crossfade timing (cover timeout 1.2 s), and that fixed bottom elements sit above the bar.
+### Possible next polish (seen in the 2026-11-04 recordings, not fixed)
+- A card's vertical swipe (`TabCard.dragGesture`) still moves by its 14 pt threshold at once. A fix must hand the flying copy (`onClose(dy, …)`) the same corrected offset, or the release will jump.
+- Leaving a page, the zoom may start ~100 ms late (unconfirmed: the tap isn't visible in the recording).
+- The deck's first drag frame moved further than the 12 pt threshold explains — possibly a dropped frame as the drag begins. Check with a 120 fps recording.
+- Keep watching the link crossfade timing (cover timeout 1.2 s).
 
 ### External / waiting
 - Mozilla OAuth client request filed: https://github.com/mozilla/fxa/issues/21691 (synced to Mozilla Jira FXA-14918). No reply yet. Mozilla's contributing guide says accounts are for Mozilla or tightly coupled parties — a "no" is possible. Never borrow another app's client ID.

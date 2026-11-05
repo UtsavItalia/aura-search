@@ -94,12 +94,11 @@ Aura Search is a free, open-source (MIT) iPhone browser that recreates Arc Searc
 
 ## 4. Current status and pending roadmap
 
-### On branch `smooth-open` — needs testing on the phone
+### Done: smooth opens (merged to `main` 2026-11-05, confirmed on the phone)
 From per-frame timing of the 2026-11-04 recording (every open froze 1–2 frames right after its first frame; Arc never freezes):
 1. Opening a card: web view held out of the window during the zoom, attached at the end (see Page transitions).
 2. Tab state saves batched and moved off the main thread (they ran at the start of every open and return).
 3. Card swipe follows from its 14 pt threshold instead of jumping by it; close/pin only on a swipe the card followed.
-**Next**: owner tests on the phone (opens should never stutter or flash; swiping a card up starts without a jump; tabs and order survive a relaunch), then merge `smooth-open` into `main`.
 
 ### Possible next polish (not fixed)
 - Returns (page → deck): 2 of 6 in the recording had one late frame (25 ms) right after the zoom started. Cause unconfirmed; candidates are the deck's first render and `takeSnapshot` for the card picture. Measure again on the new build.

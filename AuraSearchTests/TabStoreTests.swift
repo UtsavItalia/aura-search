@@ -29,6 +29,20 @@ final class TabStoreTests: XCTestCase {
         XCTAssertEqual(store.tabs[0].title, "Other")
     }
 
+    func testTheTabYouLeaveBecomesTheFrontCard() {
+        let store = makeStore()
+        let first = store.openTab(url: page)
+        let second = store.openTab(url: page)
+        let third = store.openTab(url: page)
+        let space = store.selectedSpaceID
+
+        store.moveToFront(first.id)
+        XCTAssertEqual(store.tabs(in: space).map(\.id), [second.id, third.id, first.id])
+
+        store.togglePin(third.id)
+        XCTAssertEqual(store.tabs(in: space).map(\.id), [third.id, second.id, first.id], "pinned tabs stay first")
+    }
+
     func testClosingATabArchivesIt() {
         let store = makeStore()
         let tab = store.openTab(url: page)
@@ -106,6 +120,7 @@ final class TabStoreTests: XCTestCase {
         let work = store.addSpace(name: "Work", color: .green)
         let tab = store.openTab(url: page, in: work.id)
         store.togglePin(tab.id)
+        store.saveNow()
 
         let relaunched = TabStore(fileURL: url)
         XCTAssertEqual(relaunched.spaces.map(\.name), ["Personal", "Work"])
@@ -122,6 +137,7 @@ final class TabStoreTests: XCTestCase {
         let store = TabStore(fileURL: url)
         let tab = store.openTab(url: page)
         store.showHome()
+        store.saveNow()
 
         XCTAssertEqual(TabStore(fileURL: url).activeTabID, tab.id)
     }
@@ -133,6 +149,7 @@ final class TabStoreTests: XCTestCase {
         let store = TabStore(fileURL: url)
         let tab = store.openTab(url: page)
         store.closeTab(tab.id)
+        store.saveNow()
 
         XCTAssertNil(TabStore(fileURL: url).activeTabID)
     }
@@ -145,6 +162,7 @@ final class TabStoreTests: XCTestCase {
         let normal = store.openTab(url: page)
         let secret = store.openTab(url: page, isPrivate: true)
         XCTAssertTrue(secret.isPrivate)
+        store.saveNow()
 
         let relaunched = TabStore(fileURL: url)
         XCTAssertEqual(relaunched.tabs.map(\.id), [normal.id], "private tabs don't survive a relaunch")
@@ -152,6 +170,23 @@ final class TabStoreTests: XCTestCase {
 
         store.closeTab(secret.id)
         XCTAssertFalse(store.archive.contains { $0.id == secret.id }, "private tabs leave no archive entry")
+    }
+
+    func testChangesAreSavedShortlyWithoutBeingAsked() async throws {
+        let url = temporaryStateURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        let store = TabStore(fileURL: url)
+        let tab = store.openTab(url: page)
+
+        // Saves batch up for half a second, then write off the main thread.
+        var saved: [UUID] = []
+        for _ in 0..<40 {
+            saved = TabStore(fileURL: url).tabs.map(\.id)
+            if saved == [tab.id] { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertEqual(saved, [tab.id], "saved within a moment, with no saveNow()")
     }
 
     private func temporaryStateURL() -> URL {

@@ -4,7 +4,9 @@ import SwiftUI
 /// of the screen, with the bar floating over its last stretch, as in Arc.
 ///
 /// While moving to or from the tab screen, the live page itself shrinks
-/// into its card (or grows out of it): no copy, no crossfade.
+/// into its card (or grows out of it): no copy, no crossfade. Growing out
+/// of a card, it shows the card's picture until the zoom is over and the
+/// web view is back in the window (`BrowserSession.holdBack`).
 struct BrowserView: View {
     let tab: BrowserTab
     @Binding var readerArticle: ReaderArticle?
@@ -130,7 +132,13 @@ struct BrowserView: View {
     // MARK: - Page
 
     private var pageContent: some View {
-        WebViewContainer(webView: session.webView(for: tab), bottomInset: metrics.barHeight)
+        WebViewContainer(
+            webView: session.webView(for: tab),
+            bottomInset: metrics.barHeight,
+            // Out of the window while its card grows into the page; the
+            // loading cover shows the card's picture meanwhile.
+            isAttached: session.heldBackTabID != tab.id
+        )
             .overlay { loadingCover }
             .overlay {
                 // A private page turns to frosted glass as it lands in the deck.

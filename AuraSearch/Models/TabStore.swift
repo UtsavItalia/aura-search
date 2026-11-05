@@ -24,6 +24,7 @@ final class TabStore {
     static let archiveLimit = 200
 
     private let fileURL: URL?
+    @ObservationIgnored private var saveTask: Task<Void, Never>?
 
     /// - Parameter fileURL: where state is saved. Pass `nil` for an
     ///   in-memory store (used by tests and previews).
@@ -357,7 +358,37 @@ final class TabStore {
         }
     }
 
+    // MARK: - Saving
+
+    /// Saves run here one after another, so the file always ends up with
+    /// the latest state.
+    private static let saveQueue = DispatchQueue(label: "io.github.aurasearch.state", qos: .utility)
+
+    /// Changes come in bursts (opening or leaving a tab makes two or three,
+    /// a page load updates its tab's address and title several times), so
+    /// saves wait a moment and batch up, as history's do. The file is
+    /// encoded and written off the main thread, so a save never costs a
+    /// frame in the middle of an animation: it used to run as every card
+    /// started to grow or shrink.
     private func persist() {
+        guard fileURL != nil else { return }
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            self?.save(waitingUntilDone: false)
+        }
+    }
+
+    /// Writes the state now and waits until it's on disk. Called when the
+    /// app goes to the background, so nothing waiting to be saved is lost.
+    func saveNow() {
+        save(waitingUntilDone: true)
+    }
+
+    private func save(waitingUntilDone: Bool) {
+        saveTask?.cancel()
+        saveTask = nil
         guard let fileURL else { return }
         let snapshot = Snapshot(
             spaces: spaces,
@@ -367,6 +398,14 @@ final class TabStore {
             settings: settings,
             lastViewedTabID: lastViewedTabID
         )
+        if waitingUntilDone {
+            Self.saveQueue.sync { Self.write(snapshot, to: fileURL) }
+        } else {
+            Self.saveQueue.async { Self.write(snapshot, to: fileURL) }
+        }
+    }
+
+    nonisolated private static func write(_ snapshot: Snapshot, to fileURL: URL) {
         do {
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),

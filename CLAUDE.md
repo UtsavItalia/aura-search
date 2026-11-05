@@ -24,14 +24,12 @@ Aura Search is a free, open-source (MIT) iPhone browser that recreates Arc Searc
 - No analytics, no accounts of our own, no server. Private by default (DuckDuckGo default engine).
 
 ### Architecture
-- `Models/` — `TabStore` (tabs, Spaces, archive, settings; persisted to Application Support; knows nothing about WebKit), `HistoryStore` (frecency autocomplete), `BrowserTab` (identity = `id` assigned once; URL is just current content; optional `sync: SyncMetadata` reserved for phase 2), `URLResolver`, `BrowserSettings`.
-- `Browser/` — `BrowserSession` (live web views, max 6 alive, LRU eviction saving `interactionState`; KVO + delegates torn down on discard; private tabs share one non-persistent data store dropped when the last private tab closes), `WebViewDelegate`, `SnapshotStore` (card previews, Caches dir), `DownloadManager`, `PageSummarizer`, `PinchToSummarize`, `ReaderMode`, `ContentBlocker`, `SearchSuggestions`.
-- `Views/` — `RootView` (measures the screen; hosts screens, search panel, download card, sheets), `HomeView` (tab deck), `BrowserView`, `DeckLayout` (ScreenMetrics, BarMetrics, deck math), `SearchPanel`, `TabCard`, `PageMenuView`, `SettingsView`, `DownloadsView`, `SummaryView`, etc.
+- `TabStore` knows nothing about WebKit. `BrowserTab` identity is its `id`, assigned once; the URL is just current content; `sync: SyncMetadata` is reserved for phase 2.
 - Shared state is injected via `.environment(store)` / `.environment(session)`; sheets re-inject them explicitly.
 
 ### UI decisions (Arc parity)
 - Tab deck: each card is its page at 70%; next card overlaps from the right, earlier cards stack as dimmed slivers on the left; piecewise-linear stops in `DeckLayout` measured from Arc. Swipe up on a card closes it (fast consecutive flicks supported), pull down pins. Tapping the background opens the most recent tab.
-- Page ↔ deck transition: the **live page itself** scales into/out of its card (no copy, no crossfade); other cards fly out of the tabs button. Screens use `.transition(.identity)`.
+- Page ↔ deck transition: the **live page itself** scales into/out of its card (no copy, no crossfade); other cards fly out of the tabs button. Screens use `.transition(.identity)`. Growing out of a card, the page view shows the card's picture until the zoom ends and the web view is back in the window (see Page transitions).
 - Bottom bar: tabs stack button / 76×40 "+" capsule / chevron-up menu; bar centred at `H − max(safeBottom + 10.5, 30)`; pastel background matches the deck. Private tabs: dark bar, frosted card previews (blur only for private tabs).
 - Search panel: custom panel (not a sheet) pinned to the top of the keyboard, ~31.6% of screen height, opens at launch with keyboard up (Auto-Open Keyboard setting) and from "+". History autocomplete ghost text, suggestions, private toggle.
 - Appearance defaults to System; tab cards invert for contrast.
@@ -61,22 +59,20 @@ Aura Search is a free, open-source (MIT) iPhone browser that recreates Arc Searc
 - Card shadows are cast by a plain shape behind each card; the dim overlay sits on top. Keeps shadows from re-rendering every frame.
 - Card titles are masked (not narrowed) at the next card's left edge (`headerVisibleWidth`), so titles never overlap and text isn't re-laid-out per frame.
 - Deck order is by use, like Arc: `TabStore.tabs(in:)` keeps stored order (pinned first), and `BrowserSession.showHome` calls `TabStore.moveToFront` on the tab being left *before* the deck draws, so it lands as the front (rightmost) card and no card is seen changing places. New tabs append, so they start at the front too.
-- The deck drag subtracts its 12 pt recognition distance (`DeckDrag.slop`), so the deck doesn't jump on the drag's first frame.
+- Drags follow from where they're recognised, not from the touch: the deck subtracts its 12 pt threshold (`DeckDrag.slop`), a card's vertical swipe its 14 pt (`CardDrag.slop`, kept for the release in `TabCard.swipeStart`, since `@GestureState` may already be reset in `onEnded`). The flying copy gets the same corrected offset, so release doesn't jump. A card closes or pins only on a swipe it locked onto vertically.
 
 ### Page transitions
 - New tab from search or a new-window link: `BrowserSession.arrival` grows the page in from 94% with rounded corners over the deck's pastel (`Motion.arrive`).
 - Link taps crossfade: `navigationStarting` (link/form/other, not back/forward or reload) snapshots the page; at `didCommit` the picture goes up instantly (`pageCovers`, animations disabled); it fades out (`Motion.crossfade`) when the page reports it has drawn — a script in the `.defaultClient` world posts `auraPageReady` after DOMContentLoaded + 2 animation frames (`PageReadyHandler`, weak to the session) — or after 1.2 s, or on finish/failure. Cancelled navigations (NSURLErrorCancelled) are ignored.
 - Until a page first draws, a cover hides WebKit's blank white: the leaving page's picture, else the last snapshot, else plain `systemBackground`. It appears instantly and only fades out.
-- Opening a card whose web view is still alive: WebKit drops an off-screen web view's drawing and shows white for ~100 ms when it returns. `coverUntilRedrawn` holds the card's snapshot over the page (covered, not painted) until two animation frames have run in the window (`callAsyncJavaScript` in `.defaultClient`), with a 600 ms timeout. Evicted web views being rebuilt already wait for their first paint.
+- Opening a card whose web view is still alive: the web view stays **out of the window during the zoom** (`BrowserSession.holdBack` → `heldBackTabID` → `WebViewContainer(isAttached: false)`), with the card's snapshot drawn by the loading cover, and goes in when the zoom ends (`release`). The cover then fades after two animation frames have run in the window (`callAsyncJavaScript` in `.defaultClient`), or a 600 ms timeout counted from the release. While held, `pageDidPaint` is ignored, so a load finishing mid-zoom can't lift the cover over an empty container. Why: re-attaching at the start showed ~100 ms of blank white (WebKit drops an off-screen page's drawing) and froze the zoom 1–2 frames in every open measured (WebKit waits on the main thread for the page to draw when it re-enters a window; SwiftUI animations run on the main thread, so they stall — Arc's UIKit animations don't). Not held back: no snapshot, no address, or an evicted web view being rebuilt (those already wait for first paint).
 
 ### Fixed elements and the bottom bar
 - WebKit ignores `scrollView.contentInset` when placing `position: fixed` elements, so bottom-fixed banners (cookie consent buttons) hid behind our bar. iOS 26+: `webView.obscuredContentInsets.bottom = barHeight` (public API, what Safari's toolbars use) plus the scroll inset. iOS 17–25: the web view's frame ends at the bar instead (no public API there). Card previews are width-fitted so the shorter pre-26 snapshots aren't cropped.
 
 ### Summarize Page (Apple Foundation Models)
-- `SystemLanguageModel(useCase: .general, guardrails: .permissiveContentTransformations)`; fresh `LanguageModelSession` per request; text from Readability (fallback `innerText`); chunked by `contextSize` with a chars-per-token estimate (3 Latin, 2 other scripts, 1 CJK); map (notes per part, max 8 parts) → reduce (streamed summary: one sentence + 3–5 "- " bullets).
 - iOS 27 deprecated `LanguageModelSession.GenerationError` in favour of `LanguageModelError` with different case names → errors are classified **by name** (`SummaryText.failure(for:)`), and the page language is checked up front with NaturalLanguage.
 - FoundationModels is **weak-linked** in `project.yml` so the app still launches on iOS 17–25. All model code is behind `#if canImport(FoundationModels)` + `@available(iOS 26.0, *)`.
-- Triggers: page menu "Summarize" tile, and pinching the page in past its minimum zoom (`PinchToSummarize`, haptic only when a summary opens).
 
 ## 3. What NOT to change (working; don't refactor)
 - **Screen measurement in `RootView`**: plain frames from two GeometryReaders (one ignoring all safe areas, one ignoring only the keyboard), on a `Color.clear` surface the screens sit on in an overlay. Never read safe-area insets or `UIScreen`/window sizes during layout — that caused an AttributeGraph cycle ("Cycle detected through attribute") that silently broke the + button and the launch search panel.
@@ -90,23 +86,24 @@ Aura Search is a free, open-source (MIT) iPhone browser that recreates Arc Searc
 - Weak link of FoundationModels; name-based model error classification.
 - `Motion.swift` as the single source of animation values; `CADisableMinimumFrameDurationOnPhone`.
 - `DeckGlide` + `DeckReflow` + `FrameTicker` (frame-driven deck motion), the opaque velocity fling and its z-order, shadow-behind/dim-on-top card layering, and the title mask.
-- Page covers + `PageReadyHandler` crossfade flow (and `coverUntilRedrawn` when a card opens); insert covers with animations disabled; never mark a covered tab painted from load progress.
+- Page covers + `PageReadyHandler` crossfade flow (and `holdBack`/`release` when a card opens: the web view stays out of the window during the zoom); insert covers with animations disabled; never mark a covered tab painted from load progress.
+- `TabStore` saves: batched (0.5 s) and encoded/written on a serial background queue; `saveNow()` (synchronous) when the app goes to the background and in tests. Don't go back to saving on the main thread per change — it ran at the start of every open and return.
 - Deck order by use (`moveToFront` in `showHome`, before the deck draws).
 - `obscuredContentInsets` on iOS 26+ / shortened web view frame before 26.
 - `.gitignore` entries for `*.xcodeproj/`, `Readability.js`, `Config/Local.xcconfig`.
 
 ## 4. Current status and pending roadmap
 
-### Done on `main` (pushed)
-Phase 1 local browser: Spaces, Arc-style deck and page zoom, swipe-to-close/pull-to-pin, auto-archive + Archive, history with autocomplete, search suggestions, private tabs, reader mode, tracker blocking with per-site exceptions, app links, page menu (address, back/forward, copy link, find, reader, summarize, pin, share, zoom, desktop site, move to Space), downloads (card + list + Quick Look), app icon set, signing fix.
-Summarize Page (confirmed on device) and the doubled-bullet fix (`770b98c`).
-Motion polish (`0225244`, confirmed on device): 120 fps opt-in, cheaper card rendering + title mask, deck glide/fling/reflow, app-wide `Motion` rules, new pages grow in, link crossfade, no blank-white flash before first paint, fixed bottom elements above the bar.
-Deck polish from the 2026-11-04 Arc vs Aura recordings (confirmed on device): deck ordered by use, no white flash when reopening a live tab, deck drag without the threshold jump.
+### On branch `smooth-open` — needs testing on the phone
+From per-frame timing of the 2026-11-04 recording (every open froze 1–2 frames right after its first frame; Arc never freezes):
+1. Opening a card: web view held out of the window during the zoom, attached at the end (see Page transitions).
+2. Tab state saves batched and moved off the main thread (they ran at the start of every open and return).
+3. Card swipe follows from its 14 pt threshold instead of jumping by it; close/pin only on a swipe the card followed.
+**Next**: owner tests on the phone (opens should never stutter or flash; swiping a card up starts without a jump; tabs and order survive a relaunch), then merge `smooth-open` into `main`.
 
-### Possible next polish (seen in the 2026-11-04 recordings, not fixed)
-- A card's vertical swipe (`TabCard.dragGesture`) still moves by its 14 pt threshold at once. A fix must hand the flying copy (`onClose(dy, …)`) the same corrected offset, or the release will jump.
-- Leaving a page, the zoom may start ~100 ms late (unconfirmed: the tap isn't visible in the recording).
-- The deck's first drag frame moved further than the 12 pt threshold explains — possibly a dropped frame as the drag begins. Check with a 120 fps recording.
+### Possible next polish (not fixed)
+- Returns (page → deck): 2 of 6 in the recording had one late frame (25 ms) right after the zoom started. Cause unconfirmed; candidates are the deck's first render and `takeSnapshot` for the card picture. Measure again on the new build.
+- The drag-start "dropped frame" suspicion was wrong: frame timing shows no late or frozen frame when a drag starts.
 - Keep watching the link crossfade timing (cover timeout 1.2 s).
 
 ### External / waiting
@@ -121,6 +118,4 @@ Deck polish from the 2026-11-04 Arc vs Aura recordings (confirmed on device): de
 5. Browse for Me (multi-page answers on device); single-page Summarize already shipped.
 
 ## Practical notes
-- Repo: https://github.com/UtsavItalia/aura-search (public). Local path: `~/dev/Zen-search`.
-- Build: `xcodegen generate`, then ⌘R on the iPhone; tests ⌘U.
 - Xcode console noise to ignore: keyboard "UIKBDynamicRenderFactory" spam, TUIPrediction constraint warnings, "Invalid UIScreen coordinate space conversion", WebKit sandbox/RunningBoard lines, "Updated list with error: DownloadFailed" (WebKit, not ours). App logs only on errors, prefixed `AuraSearch:`. Treat any "Cycle detected through attribute" as a real bug.

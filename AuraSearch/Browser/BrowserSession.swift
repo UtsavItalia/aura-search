@@ -43,6 +43,10 @@ final class BrowserSession {
     /// the next page has drawn and then faded out, so pages crossfade
     /// instead of blinking from one to the next.
     private(set) var pageCovers: [UUID: UIImage] = [:]
+    /// The tab whose web view is kept out of the window while its card
+    /// grows into the page, with the card's picture drawn in its place.
+    /// See `holdBack(_:)`.
+    private(set) var heldBackTabID: UUID?
 
     let store: TabStore
     /// Page previews for the home screen's tab cards.
@@ -212,10 +216,12 @@ final class BrowserSession {
                 guard let self, self.webViews[id] == nil else { return }
                 self.paintedTabs.remove(id)
                 if self.pageCovers[id] != nil { self.pageCovers[id] = nil }
+                if self.heldBackTabID == id { self.heldBackTabID = nil }
             }
         } else {
             paintedTabs.remove(id)
             if pageCovers[id] != nil { pageCovers[id] = nil }
+            if heldBackTabID == id { heldBackTabID = nil }
         }
     }
 
@@ -485,14 +491,16 @@ final class BrowserSession {
             cardRect: cardRect,
             deckPosition: deckPosition
         )
-        coverUntilRedrawn(id)
+        let heldBack = holdBack(id)
         store.activate(id)
         refreshNavigationState()
         Task {
             withAnimation(Motion.zoom) {
                 transition?.progress = 0
             } completion: { [weak self] in
-                if self?.transition?.tabID == id { self?.transition = nil }
+                guard let self else { return }
+                if self.transition?.tabID == id { self.transition = nil }
+                if heldBack { self.release(id) }
             }
         }
     }
@@ -627,28 +635,49 @@ final class BrowserSession {
         if coveredTabs.contains(id) { pageDidPaint(id) }
     }
 
-    /// A web view kept alive off screen has let go of its drawing, and for
-    /// the first few frames back on screen WebKit shows it blank white
-    /// (about 100 ms, seen as a white card growing into the page). The
-    /// card's picture covers it until the page has drawn twice in the
-    /// window, then fades out as usual. Web views being rebuilt already
-    /// wait for their first paint, so they're left alone.
-    private func coverUntilRedrawn(_ id: UUID) {
-        guard let webView = webViews[id],
+    /// Opening a card whose web view is still alive. Putting the web view
+    /// back in the window as the card starts to grow went wrong twice over
+    /// (both seen frame by frame in a screen recording):
+    /// - WebKit lets go of an off-screen page's drawing, so the page showed
+    ///   blank white until it drew again (about 100 ms);
+    /// - WebKit waits on the main thread for the page to draw when it goes
+    ///   back in a window, which froze the zoom for a frame or two.
+    ///
+    /// So the web view stays out of the window while the card grows, with
+    /// the card's picture drawn where the page will be, and goes back in
+    /// once the zoom is over (`release(_:)`), when a pause can't be seen.
+    /// Returns false when there's no picture to show: the web view then
+    /// goes in at once, as before. Web views being rebuilt already wait for
+    /// their first paint, so they're left alone too.
+    private func holdBack(_ id: UUID) -> Bool {
+        // The loading cover only shows for a tab with an address.
+        guard webViews[id] != nil,
               paintedTabs.contains(id),
-              snapshots.images[id] != nil else { return }
+              snapshots.images[id] != nil,
+              store.tabs.contains(where: { $0.id == id && $0.url != nil }) else { return false }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             coveredTabs.insert(id)
             paintedTabs.remove(id)
+            heldBackTabID = id
         }
+        return true
+    }
+
+    /// The zoom is over: the held-back web view goes into the window, and
+    /// the picture over it fades once the page has drawn there.
+    private func release(_ id: UUID) {
+        guard heldBackTabID == id else { return }
+        heldBackTabID = nil
+        // Counted from now, not from the tap, so the page gets its time.
         coverTimeouts[id]?.cancel()
         coverTimeouts[id] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(600))
             guard !Task.isCancelled else { return }
             self?.pageDidPaint(id)
         }
+        guard let webView = webViews[id] else { return }
         Task { [weak self, weak webView] in
             // Animation frames only run once the page is drawing in the
             // window again, so two of them mean it's back on screen.
@@ -674,6 +703,10 @@ final class BrowserSession {
     /// The page on screen has drawn: whatever covers it fades away (the view
     /// animates on `paintedTabs`), and the picture goes once it's faded.
     private func pageDidPaint(_ id: UUID) {
+        // Out of the window, nothing has drawn where it can be seen (a load
+        // finishing mid-zoom would otherwise lift the picture over an empty
+        // page). `release(_:)` takes over once the web view is back in.
+        guard heldBackTabID != id else { return }
         coveredTabs.remove(id)
         coverTimeouts[id]?.cancel()
         coverTimeouts[id] = nil

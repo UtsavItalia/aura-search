@@ -82,6 +82,7 @@ struct RootView: View {
                 // Clean up unused tabs whenever the app comes back to the foreground.
                 session.archiveStaleTabs()
             case .background:
+                store.saveNow()
                 session.history.saveNow()
             default:
                 break

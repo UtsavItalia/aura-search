@@ -7,6 +7,10 @@ struct WebViewContainer: UIViewRepresentable {
     let webView: WKWebView
     /// How much of the page's bottom the bar covers.
     var bottomInset: CGFloat = 0
+    /// False while the web view is kept out of the window, as it is while
+    /// a card grows into its page (`BrowserSession.holdBack`). The empty
+    /// container is under the page's cover then.
+    var isAttached = true
 
     final class Coordinator {
         var bottomConstraint: NSLayoutConstraint?
@@ -23,6 +27,7 @@ struct WebViewContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ container: UIView, context: Context) {
+        guard isAttached else { return }
         if webView.superview !== container {
             for subview in container.subviews { subview.removeFromSuperview() }
             webView.removeFromSuperview()

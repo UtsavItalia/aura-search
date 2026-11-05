@@ -36,6 +36,9 @@ struct TabCard: View {
     /// Live drag, locked to one axis once it starts. Springs back on release.
     @GestureState(resetTransaction: Transaction(animation: Motion.standard))
     private var drag = CardDrag()
+    /// The start of the swipe, kept for when it ends: by then SwiftUI may
+    /// already have reset `drag`.
+    @State private var swipeStart: SwipeStart?
     @State private var pinFeedback = 0
 
     /// How far up a card must go to close, and how far down to pin.
@@ -51,7 +54,19 @@ struct TabCard: View {
 
     struct CardDrag {
         var axis: Axis?
+        /// How far the finger had gone up or down when the swipe was
+        /// recognised. The card follows from there, so it doesn't jump by
+        /// the threshold on the swipe's first frame.
+        var slop: CGFloat = 0
         var dy: CGFloat = 0
+    }
+
+    /// Keyed by where the touch began, so a cancelled swipe can't leave a
+    /// stale value for the next one.
+    struct SwipeStart {
+        let location: CGPoint
+        let slop: CGFloat
+        let isVertical: Bool
     }
 
     var body: some View {
@@ -251,17 +266,31 @@ struct TabCard: View {
         DragGesture(minimumDistance: 14)
             .updating($drag) { value, state, _ in
                 if state.axis == nil {
-                    let vertical = abs(value.translation.height) > abs(value.translation.width)
-                    state.axis = vertical ? .vertical : .horizontal
+                    state.axis = Self.isVertical(value) ? .vertical : .horizontal
+                    state.slop = value.translation.height
                 }
                 if state.axis == .vertical {
-                    state.dy = value.translation.height
+                    state.dy = value.translation.height - state.slop
+                }
+            }
+            .onChanged { value in
+                // The same first moment `updating` saw, so the two agree.
+                if swipeStart?.location != value.startLocation {
+                    swipeStart = SwipeStart(
+                        location: value.startLocation,
+                        slop: value.translation.height,
+                        isVertical: Self.isVertical(value)
+                    )
                 }
             }
             .onEnded { value in
-                let dy = value.translation.height
-                guard abs(dy) > abs(value.translation.width) else { return }
-                let flungUp = value.predictedEndTranslation.height < -Self.closeDistance * 2.5
+                guard let start = swipeStart, start.location == value.startLocation else { return }
+                swipeStart = nil
+                // Only a swipe the card followed, judged by where it's drawn:
+                // the flying copy starts exactly there.
+                guard start.isVertical else { return }
+                let dy = value.translation.height - start.slop
+                let flungUp = value.predictedEndTranslation.height - start.slop < -Self.closeDistance * 2.5
                 if dy < -Self.closeDistance || (dy < -30 && flungUp) {
                     onClose(dy, value.velocity.height)
                 } else if dy > Self.pinDistance {
@@ -269,5 +298,10 @@ struct TabCard: View {
                     onTogglePin()
                 }
             }
+    }
+
+    /// The axis a swipe locks onto, decided once at its first moment.
+    nonisolated private static func isVertical(_ value: DragGesture.Value) -> Bool {
+        abs(value.translation.height) > abs(value.translation.width)
     }
 }

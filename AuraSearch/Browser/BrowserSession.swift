@@ -83,6 +83,17 @@ final class BrowserSession {
     /// so (or a moment passes), not on load progress alone.
     @ObservationIgnored private var coveredTabs: Set<UUID> = []
     @ObservationIgnored private var coverTimeouts: [UUID: Task<Void, Never>] = [:]
+    /// Tabs whose web view was just built (after a relaunch, or after being
+    /// dropped to save memory) and is loading its page again. Their picture
+    /// stays up until the page has finished loading, so you see the page as
+    /// you left it instead of it rebuilding itself; touching the page or a
+    /// few seconds passing lifts it sooner.
+    @ObservationIgnored private var restoringTabs: Set<UUID> = []
+    /// Lifts a restoring page's picture when you touch the page, one per
+    /// live web view (gesture recognizers don't keep their targets alive).
+    @ObservationIgnored private var touchWatchers: [UUID: TouchWatcher] = [:]
+    /// Longest a rebuilt page keeps its picture up.
+    static let restoreCoverLimit: Duration = .seconds(3)
     @ObservationIgnored private var hasHandledLaunch = false
     /// The tab each new tab was opened from, for going back to it if the
     /// new tab turns out to be only a download.
@@ -152,8 +163,13 @@ final class BrowserSession {
             self?.requestSummary(for: tabID) ?? false
         }
 
+        touchWatchers[tabID] = TouchWatcher(view: webView) { [weak self] in
+            self?.pageTouched(tabID)
+        }
+
         webViews[tab.id] = webView
         observe(webView, tabID: tab.id)
+        if tab.url != nil { beginRestoring(tab.id) }
         markUsed(tab.id)
         evictIfNeeded()
 
@@ -199,6 +215,7 @@ final class BrowserSession {
     private func discardWebView(_ id: UUID, deferringObservedChanges: Bool = false) {
         observations[id] = nil // invalidates the KVO observations
         pinchHandlers[id] = nil
+        touchWatchers[id] = nil
         clearCover(for: id)
         if let webView = webViews.removeValue(forKey: id) {
             webView.configuration.userContentController.removeScriptMessageHandler(
@@ -468,6 +485,13 @@ final class BrowserSession {
                         }
                     }
                     guard let self, self.transition?.tabID == id else { return }
+                    // Left again before its web view went back in: nothing
+                    // to wait for any more, its page is as it was.
+                    if self.heldBackTabID == id {
+                        self.heldBackTabID = nil
+                        self.coveredTabs.remove(id)
+                        self.paintedTabs.insert(id)
+                    }
                     self.store.showHome()
                     self.transition = nil
                     self.refreshNavigationState()
@@ -495,12 +519,23 @@ final class BrowserSession {
         store.activate(id)
         refreshNavigationState()
         Task {
-            withAnimation(Motion.zoom) {
+            var zoom = Transaction(animation: Motion.zoom)
+            // The page takes touches as soon as it's in place...
+            zoom.addAnimationCompletion { [weak self] in
+                guard let self, self.transition?.tabID == id else { return }
+                self.transition = nil
+            }
+            // ...but the web view goes back in only once the spring has
+            // completely stopped. "In place" comes while the page is still
+            // settling by a few points, and the pause WebKit causes when
+            // the web view goes back in showed as one frozen frame there.
+            if heldBack {
+                zoom.addAnimationCompletion(criteria: .removed) { [weak self] in
+                    self?.release(id)
+                }
+            }
+            withTransaction(zoom) {
                 transition?.progress = 0
-            } completion: { [weak self] in
-                guard let self else { return }
-                if self.transition?.tabID == id { self.transition = nil }
-                if heldBack { self.release(id) }
             }
         }
     }
@@ -532,6 +567,7 @@ final class BrowserSession {
     /// and records the visit (never for private tabs).
     func pageDidFinishLoading(in webView: WKWebView) {
         if let id = tabID(for: webView) {
+            restoringTabs.remove(id)
             pageDidPaint(id)
             if !isPrivateTab(id), let url = webView.url {
                 history.recordVisit(url: url, title: webView.title)
@@ -577,7 +613,11 @@ final class BrowserSession {
               let id = tabID(for: webView),
               id == store.activeTabID,
               transition == nil,
-              webView.url != nil else { return }
+              webView.url != nil,
+              // Only a page that has drawn is worth a picture. A new tab's
+              // first load would otherwise be covered by a picture of the
+              // empty web view: pure white, flashing in dark mode.
+              paintedTabs.contains(id) else { return }
         // A newer tap (or a redirect asking again) takes a fresh picture.
         pictureTasks[id]?.cancel()
         leavingPictures[id] = nil
@@ -632,6 +672,7 @@ final class BrowserSession {
         pictureTasks[id]?.cancel()
         pictureTasks[id] = nil
         leavingPictures[id] = nil
+        restoringTabs.remove(id)
         if coveredTabs.contains(id) { pageDidPaint(id) }
     }
 
@@ -646,15 +687,22 @@ final class BrowserSession {
     /// So the web view stays out of the window while the card grows, with
     /// the card's picture drawn where the page will be, and goes back in
     /// once the zoom is over (`release(_:)`), when a pause can't be seen.
+    /// A tab with no live web view (the first open after a relaunch, or one
+    /// dropped to save memory) gets one now, still out of the window, so
+    /// building it and starting the load happen before the zoom's first
+    /// frame and the page loads behind the picture. Building it in the
+    /// middle of the zoom froze its second frame.
+    ///
     /// Returns false when there's no picture to show: the web view then
-    /// goes in at once, as before. Web views being rebuilt already wait for
-    /// their first paint, so they're left alone too.
+    /// goes in at once, as before.
     private func holdBack(_ id: UUID) -> Bool {
         // The loading cover only shows for a tab with an address.
-        guard webViews[id] != nil,
-              paintedTabs.contains(id),
-              snapshots.images[id] != nil,
-              store.tabs.contains(where: { $0.id == id && $0.url != nil }) else { return false }
+        guard snapshots.images[id] != nil,
+              let tab = store.tabs.first(where: { $0.id == id }),
+              tab.url != nil else { return false }
+        let webView = webView(for: tab)
+        // A page that hadn't drawn yet keeps its picture until it has loaded.
+        if !paintedTabs.contains(id), webView.isLoading { beginRestoring(id) }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -668,8 +716,12 @@ final class BrowserSession {
     /// The zoom is over: the held-back web view goes into the window, and
     /// the picture over it fades once the page has drawn there.
     private func release(_ id: UUID) {
-        guard heldBackTabID == id else { return }
+        // Not if you've already gone back to the tabs: the page is shrinking
+        // into its card and stays out of the window.
+        guard heldBackTabID == id, transition == nil else { return }
         heldBackTabID = nil
+        // A page still loading lifts its picture when it has loaded.
+        guard !restoringTabs.contains(id) else { return }
         // Counted from now, not from the tap, so the page gets its time.
         coverTimeouts[id]?.cancel()
         coverTimeouts[id] = Task { [weak self] in
@@ -697,7 +749,40 @@ final class BrowserSession {
     /// The page's script reported that it has drawn its first frames.
     func pageReady(in webView: WKWebView) {
         guard let id = tabID(for: webView) else { return }
+        // A page being rebuilt has only drawn its first pieces: with a
+        // picture of the finished page up, that waits for the load to end.
+        if restoringTabs.contains(id), hasPicture(id) { return }
         pageDidPaint(id)
+    }
+
+    private func hasPicture(_ id: UUID) -> Bool {
+        pageCovers[id] != nil || snapshots.images[id] != nil
+    }
+
+    /// A web view was just built for a tab and is loading its page again.
+    private func beginRestoring(_ id: UUID) {
+        restoringTabs.insert(id)
+        coveredTabs.insert(id)
+        coverTimeouts[id]?.cancel()
+        coverTimeouts[id] = Task { [weak self] in
+            try? await Task.sleep(for: Self.restoreCoverLimit)
+            guard !Task.isCancelled, let self else { return }
+            self.stopRestoring(id)
+        }
+    }
+
+    /// Lifts a restoring page's picture now: the page is what's under it.
+    private func stopRestoring(_ id: UUID) {
+        guard restoringTabs.remove(id) != nil else { return }
+        // Held out of the window, `release(_:)` lifts it once it's back in.
+        guard heldBackTabID != id else { return }
+        pageDidPaint(id)
+    }
+
+    /// You touched a page still showing its picture: the touch goes to the
+    /// real page, so that's what you should see.
+    private func pageTouched(_ id: UUID) {
+        stopRestoring(id)
     }
 
     /// The page on screen has drawn: whatever covers it fades away (the view
@@ -707,6 +792,7 @@ final class BrowserSession {
         // finishing mid-zoom would otherwise lift the picture over an empty
         // page). `release(_:)` takes over once the web view is back in.
         guard heldBackTabID != id else { return }
+        restoringTabs.remove(id)
         coveredTabs.remove(id)
         coverTimeouts[id]?.cancel()
         coverTimeouts[id] = nil
@@ -728,6 +814,7 @@ final class BrowserSession {
         coverTimeouts[id] = nil
         leavingPictures[id] = nil
         coveredTabs.remove(id)
+        restoringTabs.remove(id)
     }
 
     // MARK: - Page actions
@@ -878,23 +965,49 @@ final class PageReadyHandler: NSObject, WKScriptMessageHandler {
 
     weak var session: BrowserSession?
 
-    /// After the page's HTML is in, two animation frames: the first is laid
-    /// out, the second means it has been painted.
+    /// Once the page has drawn real content (its first text or image, the
+    /// Paint Timing API's "first-contentful-paint"), two animation frames:
+    /// the first is laid out, the second means it's on screen. Waiting for
+    /// the HTML alone wasn't enough: some pages (Google's results) draw an
+    /// empty white page first and fill it in a second later, which flashed
+    /// white over the dark cover. Without paint timing, or if it never
+    /// comes, the page's load does; the session's time limits cap the wait.
     static var script: WKUserScript {
         WKUserScript(
             source: """
             (function () {
-              function ready() {
+              var sent = false;
+              function post() {
+                if (sent) return;
+                sent = true;
                 requestAnimationFrame(function () {
                   requestAnimationFrame(function () {
                     try { window.webkit.messageHandlers.\(name).postMessage(1); } catch (e) {}
                   });
                 });
               }
+              function hasContent(list) {
+                return list.some(function (entry) { return entry.name === "first-contentful-paint"; });
+              }
+              function waitForContent() {
+                try {
+                  if (window.PerformanceObserver &&
+                      PerformanceObserver.supportedEntryTypes.indexOf("paint") >= 0) {
+                    if (hasContent(performance.getEntriesByType("paint"))) { post(); return; }
+                    var observer = new PerformanceObserver(function (list) {
+                      if (hasContent(list.getEntries())) { observer.disconnect(); post(); }
+                    });
+                    observer.observe({ type: "paint", buffered: true });
+                    window.addEventListener("load", post, { once: true });
+                    return;
+                  }
+                } catch (e) {}
+                post();
+              }
               if (document.readyState === "loading") {
-                document.addEventListener("DOMContentLoaded", ready, { once: true });
+                document.addEventListener("DOMContentLoaded", waitForContent, { once: true });
               } else {
-                ready();
+                waitForContent();
               }
             })();
             """,

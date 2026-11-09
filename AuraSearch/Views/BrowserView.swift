@@ -158,15 +158,23 @@ struct BrowserView: View {
     @ViewBuilder
     private var loadingCover: some View {
         if !session.paintedTabs.contains(tab.id), tab.url != nil {
-            Color(.systemBackground)
-                .overlay(alignment: .top) {
-                    if let picture = session.pageCovers[tab.id] ?? session.snapshots.images[tab.id] {
-                        // Width-fitted from the top, the way it was taken.
-                        Image(uiImage: picture)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                    }
+            // The picture and the plain background sit one above the other,
+            // never overlapping. Layered, each faded on its own and halfway
+            // through the page showed through both: a dip to 75% brightness,
+            // seen as the page greying after every open in dark mode. (A
+            // compositing group fixed that but drew the dark background white.)
+            VStack(spacing: 0) {
+                if let picture = session.pageCovers[tab.id] ?? session.snapshots.images[tab.id] {
+                    // Width-fitted from the top, the way it was taken.
+                    Image(uiImage: picture)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                // Below a picture shorter than the page, or instead of one.
+                Color(.systemBackground)
+            }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .clipped()
                 .allowsHitTesting(false)
                 .transition(.asymmetric(insertion: .identity, removal: .opacity))

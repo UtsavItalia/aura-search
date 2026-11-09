@@ -32,6 +32,16 @@ struct TabCard: View {
     /// up), so the deck can send it flying from there at that speed.
     let onClose: (_ dragOffset: CGFloat, _ velocity: CGFloat) -> Void
     let onTogglePin: () -> Void
+    /// Called when the card is held still for a moment: the deck lifts it
+    /// and shows its menu. Not iOS's context menu, which lifted its copy of
+    /// the card from the wrong place: cards are moved into the deck with
+    /// offsets and scales, which only change where they're drawn.
+    var onHold: (() -> Void)?
+
+    /// How long a press must last to bring up the menu, and how far the
+    /// finger may wander meanwhile (a drag starts at 12–14pt).
+    private static let holdDuration = 0.4
+    private static let holdSlop: CGFloat = 10
 
     /// Live drag, locked to one axis once it starts. Springs back on release.
     @GestureState(resetTransaction: Transaction(animation: Motion.standard))
@@ -80,6 +90,9 @@ struct TabCard: View {
         .scaleEffect(cardScale)
         .contentShape(Rectangle())
         .onTapGesture { onOpen() }
+        .onLongPressGesture(minimumDuration: Self.holdDuration, maximumDistance: Self.holdSlop) {
+            onHold?()
+        }
         .simultaneousGesture(dragGesture)
         .sensoryFeedback(.selection, trigger: pinFeedback)
         .accessibilityElement(children: .combine)

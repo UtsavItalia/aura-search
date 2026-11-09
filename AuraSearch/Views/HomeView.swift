@@ -11,6 +11,9 @@ struct HomeView: View {
     @State private var sheet: HomeSheet?
     @State private var confirmingCloseAll = false
     @State private var confirmingDeleteSpace = false
+    /// A card is held up with its menu: the deck then sits above the bars,
+    /// so the dim covers the whole screen.
+    @State private var isHolding = false
 
     private enum HomeSheet: Identifiable {
         case settings
@@ -52,9 +55,15 @@ struct HomeView: View {
 
             // Kept with no tabs left too, so the last card swiped away
             // still flies off the top.
-            TabCarousel(tabs: tabs, tint: tint, initialPosition: initialPosition(in: tabs))
+            TabCarousel(
+                tabs: tabs,
+                tint: tint,
+                initialPosition: initialPosition(in: tabs),
+                isHolding: $isHolding
+            )
                 // A fresh deck per Space, so it starts on the right card.
                 .id(space.id)
+                .zIndex(isHolding ? 1 : 0)
 
             spaceBar(space: space, tabs: tabs)
                 .padding(.top, metrics.safeTop)
@@ -258,6 +267,21 @@ private struct TabCarousel: View {
     /// ignore touches, so the next card can be swiped while they fly.
     @State private var flyingCards: [FlyingCard] = []
     @State private var closeCount = 0
+    /// The card being held up with its menu, if any.
+    @State private var held: HeldCard?
+    /// Drives the hold's look: the card lifted, the dim and the menu shown.
+    @State private var holdShown = false
+    /// The held card is leaving the deck (closed or moved to another
+    /// Space), so it doesn't settle back into place.
+    @State private var heldLeaving = false
+    /// Closed from the menu: its flying copy is drawn instead.
+    @State private var heldCopyHidden = false
+    @State private var holdMenuPage = HoldMenu.Page.main
+    @State private var holdCount = 0
+    @Binding var isHolding: Bool
+
+    /// How much a held card grows as it lifts.
+    private static let holdLift: CGFloat = 1.04
 
     /// A swiped-away card as it was the moment the finger let go.
     private struct FlyingCard: Identifiable {
@@ -275,6 +299,9 @@ private struct TabCarousel: View {
         /// so letting go doesn't pop it up over its neighbor.
         let zIndex: Double
         var lift: CGFloat
+        /// Grown about the page's middle, for a card closed from its menu
+        /// while lifted.
+        var liftScale: CGFloat = 1
     }
 
     private struct DeckDrag {
@@ -286,10 +313,11 @@ private struct TabCarousel: View {
         var slop: CGFloat = 0
     }
 
-    init(tabs: [BrowserTab], tint: Color, initialPosition: CGFloat) {
+    init(tabs: [BrowserTab], tint: Color, initialPosition: CGFloat, isHolding: Binding<Bool>) {
         self.tabs = tabs
         self.tint = tint
         _position = State(initialValue: initialPosition)
+        _isHolding = isHolding
     }
 
     var body: some View {
@@ -340,6 +368,7 @@ private struct TabCarousel: View {
                         previewHidden: isMoving,
                         onOpen: { open(tab, at: u) },
                         onClose: { dragOffset, velocity in
+                            guard heldTabID == nil else { return }
                             fling(
                                 tab,
                                 at: u,
@@ -350,17 +379,29 @@ private struct TabCarousel: View {
                                 headerWidth: headerWidth
                             )
                         },
-                        onTogglePin: { withAnimation(Motion.quick) { store.togglePin(tab.id) } }
+                        onTogglePin: {
+                            guard heldTabID == nil else { return }
+                            withAnimation(Motion.quick) { store.togglePin(tab.id) }
+                        },
+                        onHold: {
+                            hold(HeldCard(
+                                tab: tab,
+                                u: u,
+                                titleOpacity: titleOpacity,
+                                iconOpacity: iconOpacity,
+                                headerWidth: headerWidth
+                            ))
+                        }
                     )
                     .frame(width: size.width, height: totalHeight)
                     .scaleEffect(restScale + (launchScale - restScale) * e, anchor: anchor)
-                    .opacity(DeckLayout.opacity(u) * (1 - 0.6 * Double(e)))
+                    // While held, its lifted copy is drawn instead.
+                    .opacity(heldTabID == tab.id ? 0 : DeckLayout.opacity(u) * (1 - 0.6 * Double(e)))
                     .offset(x: restX + (launchX - restX) * e, y: cardY + launchDY * e)
                     // Later cards sit on top of earlier ones.
                     .zIndex(Double(index))
                     // A closed card leaves at once; its flying copy is drawn instead.
                     .transition(.identity)
-                    .contextMenu { menu(for: tab) }
                     .task(id: tab.id) {
                         if tab.isPrivate {
                             await session.snapshots.loadCardPreviewIfNeeded(tab.id)
@@ -387,11 +428,17 @@ private struct TabCarousel: View {
                     onTogglePin: {}
                 )
                 .frame(width: size.width, height: totalHeight)
+                .scaleEffect(card.liftScale, anchor: Self.pageCenter(anchor))
                 .scaleEffect(card.scale, anchor: anchor)
                 .offset(x: card.x, y: cardY)
                 .zIndex(card.zIndex)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
+            }
+
+            if let held {
+                holdLayer(held)
+                    .zIndex(1000)
             }
         }
         .frame(width: m.width, height: m.height, alignment: .topLeading)
@@ -415,6 +462,11 @@ private struct TabCarousel: View {
         }
         .accessibilityHidden(tabs.isEmpty)
         .sensoryFeedback(.impact(weight: .medium), trigger: closeCount)
+        .sensoryFeedback(.impact(weight: .medium), trigger: holdCount)
+        .onChange(of: tabs.map(\.id)) { _, ids in
+            // Its tab went some other way: nothing left to hold.
+            if let heldTabID, !heldLeaving, !ids.contains(heldTabID) { endHold() }
+        }
         .onChange(of: tabs.count) { _, count in
             // After a close, settle on the nearest place the deck can rest,
             // carrying on at the speed it's gliding, if it is.
@@ -468,7 +520,9 @@ private struct TabCarousel: View {
         velocity: CGFloat,
         titleOpacity: Double,
         iconOpacity: Double,
-        headerWidth: CGFloat?
+        headerWidth: CGFloat?,
+        dim: Double? = nil,
+        liftScale: CGFloat = 1
     ) {
         let m = metrics
         let size = DeckLayout.cardSize(in: m)
@@ -482,13 +536,15 @@ private struct TabCarousel: View {
             blurredPreview: tab.isPrivate ? session.snapshots.cardPreviews[tab.id] : nil,
             x: DeckLayout.x(u) * m.width,
             scale: DeckLayout.scale(u),
-            dim: DeckLayout.dim(u),
+            dim: dim ?? DeckLayout.dim(u),
             titleOpacity: titleOpacity,
             iconOpacity: iconOpacity,
             headerVisibleWidth: headerWidth,
             // The cards after it take its place (and number) as it closes.
-            zIndex: Double(index) - 0.5,
-            lift: dragOffset
+            // One closed from its menu was lifted above everything.
+            zIndex: liftScale > 1 ? 1001 : Double(index) - 0.5,
+            lift: dragOffset,
+            liftScale: liftScale
         )
         flyingCards.append(card)
         closeCount += 1
@@ -536,6 +592,8 @@ private struct TabCarousel: View {
     private var deckGesture: some Gesture {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
+                // The deck stays put under a held card's menu.
+                guard heldTabID == nil else { return }
                 // A new touch (or one after a cancelled drag) starts fresh.
                 if drag.start != value.startLocation {
                     drag = DeckDrag(start: value.startLocation, startPosition: position, isHorizontal: nil)
@@ -581,27 +639,285 @@ private struct TabCarousel: View {
         }
     }
 
-    @ViewBuilder
-    private func menu(for tab: BrowserTab) -> some View {
-        Button(tab.isPinned ? "Unpin" : "Pin", systemImage: tab.isPinned ? "pin.slash" : "pin") {
-            withAnimation(Motion.quick) { store.togglePin(tab.id) }
+    // MARK: - Holding a card
+
+    /// A held card as it was the moment the hold began. The deck stands
+    /// still while its menu is up, so this is where it stays.
+    private struct HeldCard {
+        let tab: BrowserTab
+        let u: CGFloat
+        let titleOpacity: Double
+        let iconOpacity: Double
+        let headerWidth: CGFloat?
+    }
+
+    private var heldTabID: UUID? { held?.tab.id }
+
+    /// Grows about the middle of the page rather than the deck's anchor,
+    /// so a lifted card stays centred where it was.
+    private static func pageCenter(_ anchor: UnitPoint) -> UnitPoint {
+        UnitPoint(x: 0.5, y: anchor.y)
+    }
+
+    /// Lifts a card where it is, dims everything else and shows the card's
+    /// menu under it. The deck holds still meanwhile.
+    private func hold(_ card: HeldCard) {
+        guard held == nil, session.transition == nil else { return }
+        glide.stop()
+        heldLeaving = false
+        heldCopyHidden = false
+        holdMenuPage = .main
+        held = card
+        isHolding = true
+        holdCount += 1
+        // Next frame, once the copy is drawn exactly over the card.
+        Task {
+            withAnimation(Motion.present) { holdShown = true }
         }
+    }
+
+    /// Settles the card back into place (or lets it go, if it's leaving)
+    /// and takes the menu away; `then` runs once it's all gone.
+    private func dismissHold(then action: (() -> Void)? = nil) {
+        guard let id = heldTabID, holdShown else { return }
+        withAnimation(Motion.dismiss) {
+            holdShown = false
+        } completion: {
+            guard heldTabID == id else { return }
+            endHold()
+            action?()
+        }
+    }
+
+    private func endHold() {
+        held = nil
+        holdShown = false
+        heldLeaving = false
+        heldCopyHidden = false
+        holdMenuPage = .main
+        isHolding = false
+    }
+
+    /// The card goes back first, then moves to where pinned cards go, so
+    /// it's never seen jumping from its lifted place.
+    private func pinFromMenu(_ card: HeldCard) {
+        dismissHold {
+            withAnimation(Motion.quick) { store.togglePin(card.tab.id) }
+        }
+    }
+
+    /// Thrown up and away from where it's lifted, as if swiped: the same
+    /// close, whichever way you choose.
+    private func closeFromMenu(_ card: HeldCard) {
+        // The flying copy takes over from the lifted one, drawn the same.
+        heldCopyHidden = true
+        heldLeaving = true
+        fling(
+            card.tab,
+            at: card.u,
+            dragOffset: 0,
+            velocity: -1400,
+            titleOpacity: card.titleOpacity,
+            iconOpacity: card.iconOpacity,
+            headerWidth: card.headerWidth,
+            dim: 0,
+            liftScale: Self.holdLift
+        )
+        dismissHold()
+    }
+
+    /// Fades out with the menu while the cards after it close the gap.
+    private func moveFromMenu(_ card: HeldCard, to space: Space) {
+        heldLeaving = true
+        dismissHold()
+        remove(card.tab) { store.moveTab(card.tab.id, to: space.id) }
+    }
+
+    /// The dim, the lifted card and its menu, over everything else.
+    @ViewBuilder
+    private func holdLayer(_ card: HeldCard) -> some View {
+        let m = metrics
+        let size = DeckLayout.cardSize(in: m)
+        let totalHeight = size.height + DeckLayout.headerHeight + DeckLayout.headerSpacing
+        let anchor = DeckLayout.scaleAnchor(in: m)
+        let cardY = DeckLayout.cardTop(in: m) - DeckLayout.headerHeight - DeckLayout.headerSpacing
+        let shown = holdShown
+        let tab = card.tab
         let otherSpaces = store.spaces.filter { $0.id != tab.spaceID }
-        if !otherSpaces.isEmpty {
-            Menu {
-                ForEach(otherSpaces) { space in
-                    Button(space.name) {
-                        remove(tab) { store.moveTab(tab.id, to: space.id) }
-                    }
+
+        // Under the lifted page, or above it if there's no room below.
+        let page = DeckLayout.previewRect(u: card.u, in: m)
+        let menuHeight = HoldMenu.height(page: holdMenuPage, spaceCount: otherSpaces.count)
+        let floor = m.barCenterY - BarMetrics.tapSize / 2 - 12
+        let below = page.midY + page.height * Self.holdLift / 2 + 12
+        let menuY = min(below, floor - menuHeight)
+        let menuX = min(max(page.minX, 16), m.width - HoldMenu.width - 16)
+
+        ZStack(alignment: .topLeading) {
+            Color.black
+                .opacity(shown ? 0.35 : 0)
+                .frame(width: m.width, height: m.height)
+                .contentShape(Rectangle())
+                .onTapGesture { dismissHold() }
+                .accessibilityLabel("Close menu")
+                .accessibilityAddTraits(.isButton)
+
+            if !heldCopyHidden {
+                TabCard(
+                    tab: tab,
+                    tint: tint,
+                    snapshot: tab.isPrivate ? nil : session.snapshots.images[tab.id],
+                    blurredPreview: tab.isPrivate ? session.snapshots.cardPreviews[tab.id] : nil,
+                    // Lifted, it's in front of everything: no shade.
+                    dim: shown ? 0 : DeckLayout.dim(card.u),
+                    titleOpacity: card.titleOpacity,
+                    iconOpacity: card.iconOpacity,
+                    headerVisibleWidth: card.headerWidth,
+                    onOpen: {},
+                    onClose: { _, _ in },
+                    onTogglePin: {}
+                )
+                .frame(width: size.width, height: totalHeight)
+                .scaleEffect(shown ? Self.holdLift : 1, anchor: Self.pageCenter(anchor))
+                .scaleEffect(DeckLayout.scale(card.u), anchor: anchor)
+                .opacity(heldLeaving && !shown ? 0 : 1)
+                .offset(x: DeckLayout.x(card.u) * m.width, y: cardY)
+                // A tap on it closes the menu, like a tap anywhere else.
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+
+            HoldMenu(
+                tab: tab,
+                otherSpaces: otherSpaces,
+                page: holdMenuPage,
+                onPin: { pinFromMenu(card) },
+                onShowSpaces: { withAnimation(Motion.quick) { holdMenuPage = .spaces } },
+                onBack: { withAnimation(Motion.quick) { holdMenuPage = .main } },
+                onMove: { space in moveFromMenu(card, to: space) },
+                onClose: { closeFromMenu(card) }
+            )
+            .scaleEffect(shown ? 1 : 0.85, anchor: .top)
+            .opacity(shown ? 1 : 0)
+            .offset(x: menuX, y: menuY)
+            .allowsHitTesting(shown)
+        }
+        .frame(width: m.width, height: m.height, alignment: .topLeading)
+        .accessibilityAction(.escape) { dismissHold() }
+    }
+}
+
+/// A held card's menu: Pin, Move to Space and Close Tab, styled like the
+/// app rather than iOS's context menu. Move to Space turns the menu into
+/// the list of Spaces, with a row to go back.
+private struct HoldMenu: View {
+    enum Page { case main, spaces }
+
+    let tab: BrowserTab
+    let otherSpaces: [Space]
+    let page: Page
+    let onPin: () -> Void
+    let onShowSpaces: () -> Void
+    let onBack: () -> Void
+    let onMove: (Space) -> Void
+    let onClose: () -> Void
+
+    static let width: CGFloat = 250
+    static let rowHeight: CGFloat = 48
+
+    static func height(page: Page, spaceCount: Int) -> CGFloat {
+        let rows: Int
+        switch page {
+        case .main: rows = spaceCount > 0 ? 3 : 2
+        case .spaces: rows = 1 + spaceCount
+        }
+        return CGFloat(rows) * rowHeight
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+        VStack(spacing: 0) {
+            switch page {
+            case .main:
+                row(tab.isPinned ? "Unpin" : "Pin", systemImage: tab.isPinned ? "pin.slash" : "pin", action: onPin)
+                if !otherSpaces.isEmpty {
+                    Divider()
+                    row("Move to Space", systemImage: "arrow.right.square", trailing: "chevron.right", action: onShowSpaces)
                 }
-            } label: {
-                Label("Move to Space", systemImage: "arrow.right.square")
+                Divider()
+                row("Close Tab", systemImage: "xmark", isDestructive: true, action: onClose)
+            case .spaces:
+                row("Move to Space", systemImage: "chevron.left", isHeader: true, action: onBack)
+                ForEach(otherSpaces) { space in
+                    Divider()
+                    Button { onMove(space) } label: {
+                        HStack(spacing: 12) {
+                            Circle()
+                                .fill(space.color.color)
+                                .frame(width: 10, height: 10)
+                                .frame(width: 22)
+                            Text(space.name)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                        }
+                        .rowLayout()
+                    }
+                    .buttonStyle(HoldRowStyle())
+                }
             }
         }
-        Divider()
-        Button("Close Tab", systemImage: "xmark", role: .destructive) {
-            remove(tab) { session.closeTab(tab.id) }
+        .frame(width: Self.width)
+        .background(.regularMaterial, in: shape)
+        .clipShape(shape)
+        // A hairline edge, no shadow: the dim behind already sets it apart,
+        // and a blurred shadow around a material is redrawn off-screen on
+        // every frame it grows in, which stalled the lift's first frames.
+        .overlay(shape.strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+    }
+
+    private func row(
+        _ title: String,
+        systemImage: String,
+        trailing: String? = nil,
+        isDestructive: Bool = false,
+        isHeader: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: systemImage)
+                    .frame(width: 22)
+                Text(title)
+                    .fontWeight(isHeader ? .semibold : .regular)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                if let trailing {
+                    Image(systemName: trailing)
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .foregroundStyle(isDestructive ? Color.red : Color.primary)
+            .rowLayout()
         }
+        .buttonStyle(HoldRowStyle())
+    }
+}
+
+private extension View {
+    func rowLayout() -> some View {
+        padding(.horizontal, 16)
+            .frame(height: HoldMenu.rowHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+    }
+}
+
+/// A menu row lights up under the finger, like iOS's own menus.
+private struct HoldRowStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(Color.primary.opacity(configuration.isPressed ? 0.1 : 0))
     }
 }
 
